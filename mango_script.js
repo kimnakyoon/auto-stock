@@ -116,6 +116,10 @@ function mangoAutoLoop(CFG) {
     const SUCCESS_TEXT = '상품의 가격 업데이트 및 선택하신 마켓으로 상품 전송이 모두 완료되었습니다.';
     const normalizedSuccess = SUCCESS_TEXT.replace(/\s+/g, '');
     const ERROR_TEXT = '페이지 로딩이 잠시 지연';
+    // 💡 마켓 로그인 체크 실패 등으로 작업이 시작도 못 하고 끝났을 때 뜨는 문구
+    //    ("전송가능한 업데이트 또는 마켓이 없습니다. 전송을 종료합니다.")
+    const ABORT_TEXT = '전송을 종료합니다';
+    const normalizedAbort = ABORT_TEXT.replace(/\s+/g, '');
 
     // 💡 카페24 서버 과부하 시 뜨는 "페이지 로딩이 잠시 지연되었습니다" 에러 페이지 감지
     function isErrorPage(win) {
@@ -384,7 +388,29 @@ function mangoAutoLoop(CFG) {
                         continue;
                     }
 
+                    // 진행 메시지 영역(layer_page)을 한 번만 읽어 "전송 종료"와 "완료"를 함께 판정
                     const layer = (t.win.document.getElementById('layer_page')?.innerText || '').replace(/\s+/g, '');
+
+                    // 💡 "전송을 종료합니다" 조기 종료 → 해당 창만 닫고 같은 구간으로 새 창을 열어 다시 실행
+                    if (!t.setupIt && layer.includes(normalizedAbort)) {
+                        allFinished = false;
+                        t.abortCount = (t.abortCount || 0) + 1;
+                        log(`⚠️ [${t.start}~${t.end}] 전송 종료 문구 감지 → 창 닫고 재실행 ${t.abortCount}회차`);
+                        try { t.win.close(); } catch (e) {}
+
+                        const nw = window.open(MAIN_URL, '_blank');
+                        if (!nw) {
+                            t.done = true;
+                            log(`⚠️ [${t.start}~${t.end}] 재실행 창을 열지 못했습니다. (팝업 차단 확인)`);
+                            continue;
+                        }
+                        nw.opener = null;
+                        t.win = nw;
+                        t.ready = false;
+                        startWorkerSetup(t);
+                        continue;
+                    }
+
                     if (layer.includes(normalizedSuccess)) {
                         t.done = true;
                         log(`✅ [${t.start}~${t.end}] 완료. (3초 후 탭 자동 종료)`);

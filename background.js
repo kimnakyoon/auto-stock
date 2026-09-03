@@ -160,3 +160,176 @@ chrome.windows.onRemoved.addListener(async (winId) => {
     await ensureLoaded();
     if (winTarget[String(winId)]) { delete winTarget[String(winId)]; saveState(); }
 });
+
+
+// ═══════════════════════════════════════════════════════════════
+// 💡 SSG 자동 재로그인
+//    팝업에서 "SSG 로그인 실행"을 누른 탭 하나만 사용한다.
+//    1시간마다 그 탭을 SSG 주문목록 주소로 보내서, 로그인 화면으로 넘어가면
+//    저장된 아이디/비밀번호로 자동 로그인한다. chrome.alarms + 백그라운드에서
+//    돌기 때문에 다른 창이 선택되어 있어도 동작하고, 창을 앞으로 가져오지 않는다.
+// ═══════════════════════════════════════════════════════════════
+const SSG_ALARM = 'mango_ssg_check';
+const SSG_CHECK_MINUTES = 60;                       // 로그인 확인 주기 (1시간)
+// 로그인이 풀려 있으면 member.ssg.com 로그인 화면으로 넘어가는 주소 (마이페이지 주문목록)
+const SSG_CHECK_URL = 'https://pay.ssg.com/myssg/orderInfo.ssg?viewType=Ssg&page=1';
+const SSG_LOG_MAX = 30;
+
+const isSsgLoginUrl = (url) => /login\.ssg|member\.ssg\.com/i.test(url || '');
+const ssgWait = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function ssgGetState() {
+    const r = await chrome.storage.local.get('ssgAuto');
+    return r.ssgAuto || { running: false, tabId: null, id: '', pw: '', log: [] };
+}
+// 기록 한 줄을 남기면서 상태(patch)도 같이 저장한다 (storage 쓰기 1회)
+async function ssgLog(msg, patch) {
+    const st = await ssgGetState();
+    if (patch) Object.assign(st, patch);
+    const d = new Date();
+    const p2 = (n) => String(n).padStart(2, '0');
+    const line = `[${p2(d.getMonth() + 1)}/${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}] ${msg}`;
+    st.log = [...(st.log || []), line].slice(-SSG_LOG_MAX);
+    st.lastMsg = line;
+    await chrome.storage.local.set({ ssgAuto: st });
+    console.log('[SSG]', line);
+}
+
+// 탭 로딩이 끝날 때까지 대기 (최대 timeout ms)
+function ssgWaitForLoad(tabId, timeout = 30000) {
+    return new Promise(resolve => {
+        let done = false;
+        const finish = () => { if (done) return; done = true; chrome.tabs.onUpdated.removeListener(onUpd); resolve(); };
+        const onUpd = (id, info) => { if (id === tabId && info.status === 'complete') finish(); };
+        chrome.tabs.onUpdated.addListener(onUpd);
+        setTimeout(finish, timeout);
+    });
+}
+
+// SSG 로그인 화면에 아이디/비밀번호를 넣고 로그인 버튼을 누른다 (페이지 안에서 실행)
+function ssgFillAndSubmit(id, pw) {
+    const q = (sels) => { for (const s of sels) { const el = document.querySelector(s); if (el) return el; } return null; };
+    const idEl = q(['#mem_id', 'input[name="mem_id"]', 'input[name="loginId"]']);
+    const pwEl = q(['#mem_pw', 'input[name="mem_pw"]', 'input[name="loginPw"]', 'input[type="password"]']);
+    if (!idEl || !pwEl) return { ok: false, reason: '아이디/비밀번호 입력칸을 찾지 못함' };
+
+    const setVal = (el, v) => {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        setter.call(el, v);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    setVal(idEl, id);
+    setVal(pwEl, pw);
+
+    const txt = (el) => ((el.innerText || el.value || '') + '').replace(/\s+/g, '');
+    const btn = [...document.querySelectorAll('button, a, input[type="submit"], input[type="button"]')]
+        .find(el => txt(el) === '로그인' && el.offsetParent !== null)
+        || document.querySelector('button[type="submit"], .btn_login, #btn_login');
+    if (btn) { btn.click(); return { ok: true, how: 'button' }; }
+    const form = pwEl.closest('form');
+    if (form) { form.requestSubmit ? form.requestSubmit() : form.submit(); return { ok: true, how: 'form' }; }
+    return { ok: false, reason: '로그인 버튼을 찾지 못함' };
+}
+
+let ssgBusy = false;
+async function ssgCheck(reason) {
+    if (ssgBusy) return;
+    ssgBusy = true;
+    try {
+        const st = await ssgGetState();
+        if (!st.running || !st.tabId) return;
+
+        let tab;
+        try { tab = await chrome.tabs.get(st.tabId); }
+        catch (e) {
+            await ssgStop('❌ SSG 로그인용 탭이 닫혀 있어 자동 재로그인을 중지합니다.');
+            return;
+        }
+
+        await ssgLog(`🔍 로그인 상태 확인 시작 (${reason})`);
+        // 다른 창을 건드리지 않도록 active/focused 는 지정하지 않는다
+        const loaded = ssgWaitForLoad(tab.id);
+        await chrome.tabs.update(tab.id, { url: SSG_CHECK_URL });
+        await loaded;
+        await ssgWait(2000); // 자바스크립트 리다이렉트가 자리잡을 시간
+
+        tab = await chrome.tabs.get(tab.id);
+        if (!isSsgLoginUrl(tab.url)) {
+            await ssgLog('✅ SSG 로그인 유지 중', { lastCheck: Date.now(), loggedIn: true });
+            return;
+        }
+
+        await ssgLog('⚠️ 로그인이 풀려 있음 → 자동 로그인 시도');
+        if (!st.id || !st.pw) { await ssgLog('❌ 아이디/비밀번호가 저장되어 있지 않아 로그인할 수 없습니다.'); return; }
+
+        // 로그인 화면이 아직 완전히 그려지지 않았을 수 있어 입력칸이 나타날 때까지 잠시 대기
+        let res = null;
+        for (let i = 0; i < 5; i++) {
+            try {
+                const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: ssgFillAndSubmit, args: [st.id, st.pw] });
+                res = r && r.result;
+            } catch (e) { res = { ok: false, reason: e.message }; }
+            if (res && res.ok) break;
+            await ssgWait(1500);
+        }
+        if (!res || !res.ok) {
+            await ssgLog(`❌ 자동 로그인 실패: ${(res && res.reason) || '스크립트 실행 오류'}`, { lastCheck: Date.now(), loggedIn: false });
+            return;
+        }
+
+        // 로그인 처리 대기 (최대 30초): 로그인 화면에서 벗어나면 성공
+        for (let i = 0; i < 20; i++) {
+            await ssgWait(1500);
+            try { tab = await chrome.tabs.get(tab.id); } catch (e) { break; }
+            if (!isSsgLoginUrl(tab.url)) {
+                await ssgLog('✅ SSG 자동 로그인 성공', { lastCheck: Date.now(), loggedIn: true });
+                return;
+            }
+        }
+        await ssgLog('❌ 로그인 버튼을 눌렀지만 로그인 화면에서 벗어나지 못함 (비밀번호/보안문자 확인 필요)', { lastCheck: Date.now(), loggedIn: false });
+    } catch (e) {
+        await ssgLog(`❌ 오류: ${e.message}`);
+    } finally {
+        ssgBusy = false;
+    }
+}
+
+async function ssgStart(tabId, id, pw) {
+    await chrome.alarms.create(SSG_ALARM, { periodInMinutes: SSG_CHECK_MINUTES });
+    await ssgLog(`▶ SSG 자동 재로그인 시작 (탭 ${tabId}, ${SSG_CHECK_MINUTES}분마다 확인)`,
+        { running: true, tabId, id, pw, loggedIn: null });
+    ssgCheck('시작 직후'); // 기다리지 않고 바로 첫 확인
+}
+
+async function ssgStop(why = '⏹ SSG 자동 재로그인 중지') {
+    await chrome.alarms.clear(SSG_ALARM);
+    await ssgLog(why, { running: false, tabId: null });
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === SSG_ALARM) ssgCheck('1시간 주기');
+});
+
+// 팝업에서 오는 명령
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || typeof msg.type !== 'string' || !msg.type.startsWith('ssg_')) return;
+    (async () => {
+        if (msg.type === 'ssg_start') await ssgStart(msg.tabId, msg.id, msg.pw);
+        else if (msg.type === 'ssg_stop') await ssgStop();
+        sendResponse(await ssgGetState());
+    })();
+    return true; // 비동기 응답
+});
+
+// 로그인용 탭이 닫히면 자동으로 중지
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+    const st = await ssgGetState();
+    if (st.running && st.tabId === tabId) await ssgStop('❌ SSG 로그인용 탭이 닫혀 자동 재로그인을 중지합니다.');
+});
+
+// 브라우저를 다시 켰을 때: 이전 탭은 사라졌으므로 실행 상태를 정리
+chrome.runtime.onStartup.addListener(async () => {
+    const st = await ssgGetState();
+    if (st.running) await ssgStop('ℹ️ 브라우저가 다시 시작되어 SSG 자동 재로그인이 꺼졌습니다. 다시 실행해주세요.');
+});

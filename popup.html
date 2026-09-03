@@ -11,6 +11,12 @@
     .coord-group div { flex: 1; font-size: 11px; font-weight: normal; }
     button { width: 100%; padding: 12px 0; color: white; background: #2980b9; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 13px; margin-top: 10px; }
     button:hover { background: #1f6391; }
+    .ssg-btns { display: flex; gap: 6px; }
+    .ssg-btn { background: #16a085; padding: 8px 0; font-size: 12px; margin-top: 8px; }
+    .ssg-btn:hover { background: #117a65; }
+    .ssg-btn.stop { background: #7f8c8d; }
+    .ssg-btn.stop:hover { background: #626e70; }
+    .ssg-status { margin-top: 6px; font-size: 11px; font-weight: normal; color: #555; white-space: pre-line; line-height: 1.5; max-height: 80px; overflow-y: auto; }
   </style>
 </head>
 <body>
@@ -28,22 +34,18 @@
     작업 분할 방식
     <select id="divideMode">
       <option value="custom">직접 개수 입력</option>
-      <option value="2">전체 1/2씩 (창 2개로 분할)</option>
-      <option value="3">전체 1/3씩 (창 3개로 분할)</option>
-      <option value="4">전체 1/4씩 (창 4개로 분할)</option>
-      <option value="5">전체 1/5씩 (창 5개로 분할)</option>
-      <option value="6">전체 1/6씩 (창 6개로 분할)</option>
-      <option value="7">전체 1/7씩 (창 7개로 분할)</option>
-      <option value="8">전체 1/8씩 (창 8개로 분할)</option>
-      <option value="9">전체 1/9씩 (창 9개로 분할)</option>
-      <option value="10">전체 1/10씩 (창 10개로 분할)</option>
-      <option value="13">전체 1/13씩 (창 13개로 분할)</option>
+      <option value="windows">직접 창 개수 입력</option>
     </select>
   </div>
   
   <div class="row" id="customBatchRow">
     한 창당 처리 개수
     <input type="number" id="batchSize" value="800">
+  </div>
+
+  <div class="row" id="windowCountRow" style="display:none;">
+    창 개수 (전체를 이 개수만큼 나눠서 실행)
+    <input type="number" id="windowCount" value="2" min="1">
   </div>
 
   <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;">
@@ -61,6 +63,21 @@
   </div>
 
   <button id="btnRun">▶ 자동화 실행</button>
+
+  <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;">
+
+  <div class="row">
+    SSG 자동 재로그인 (1시간마다 확인)
+    <div class="coord-group">
+      <div>아이디 <input type="text" id="ssgId" autocomplete="off"></div>
+      <div>비밀번호 <input type="password" id="ssgPw" autocomplete="off"></div>
+    </div>
+    <div class="ssg-btns">
+      <button id="btnSsgStart" class="ssg-btn">SSG 로그인 실행</button>
+      <button id="btnSsgStop" class="ssg-btn stop">중지</button>
+    </div>
+    <div id="ssgStatus" class="ssg-status">상태: 꺼짐</div>
+  </div>
   
   <script src="popup.js"></script>
 </body>
