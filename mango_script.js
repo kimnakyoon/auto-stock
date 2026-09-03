@@ -307,6 +307,10 @@ function mangoAutoLoop(CFG) {
 
     const sleep = (ms) => new Promise(r => bgTimer.setTimeout(r, ms));
 
+    // 💡 [실행 탭 복귀] 새 작업 탭들이 앞으로 나오면서 이 탭(작업 로그가 보이는 실행 탭)이 가려지므로,
+    //    창을 다 연 뒤 확장(popup.js가 심어둔 브리지 → background.js)에 신호를 보내 이 탭으로 되돌아온다
+    const focusRunner = () => { try { window.postMessage({ type: 'MANGO_FOCUS_RUNNER' }, location.origin); } catch (e) {} };
+
     async function runCycle() {
         log('🔄 사이클 시작 - 전체 수량 파악용 임시 탭을 엽니다.');
         const total = await fetchTotalCount();
@@ -367,6 +371,12 @@ function mangoAutoLoop(CFG) {
             }
         }
 
+        // 💡 창을 모두 열었으니 실행 탭(이 탭)으로 돌아온다
+        if (workers.some(t => t.win)) {
+            log('↩️ 모든 창을 열었습니다 → 실행 탭으로 돌아옵니다.');
+            focusRunner();
+        }
+
         const monitorIt = bgTimer.setInterval(() => {
             let allFinished = true;
             for (const t of workers) {
@@ -408,6 +418,7 @@ function mangoAutoLoop(CFG) {
                         t.win = nw;
                         t.ready = false;
                         startWorkerSetup(t);
+                        focusRunner(); // 재실행 창이 앞으로 나오므로 실행 탭으로 되돌아온다
                         continue;
                     }
 

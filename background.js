@@ -423,9 +423,20 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
     if (ssgLoggedOut(await ssgProbe(tabId))) ssgTrigger('화면에 로그인 표시 감지');
 });
 
-// 팝업에서 오는 명령
+// 💡 [실행 탭 복귀] 매크로 실행 탭(mango_script.js)이 작업 창을 모두 연 뒤 보내는 신호
+//    → 새 탭들이 앞으로 나오면서 가려진 실행 탭(작업 로그가 보이는 탭)을 다시 활성화한다
+async function focusTab(tab) {
+    try {
+        await chrome.tabs.update(tab.id, { active: true });
+        await chrome.windows.update(tab.windowId, { focused: true });
+    } catch (e) {}
+}
+
+// 팝업/실행 탭에서 오는 명령
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || typeof msg.type !== 'string' || !msg.type.startsWith('ssg_')) return;
+    if (!msg || typeof msg.type !== 'string') return;
+    if (msg.type === 'mango_focus_runner') { if (sender.tab) focusTab(sender.tab); return; }
+    if (!msg.type.startsWith('ssg_')) return;
     (async () => {
         if (msg.type === 'ssg_start') await ssgStart(msg.id, msg.pw);
         else if (msg.type === 'ssg_stop') await ssgStop();
