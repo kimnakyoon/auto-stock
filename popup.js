@@ -114,17 +114,20 @@ document.getElementById('btnRun').addEventListener('click', async () => {
     args: [sVal, eVal, mode, bVal, wVal, xVal, yVal]
   });
 
-  // 💡 [실행 탭 복귀 브리지] 페이지(MAIN)에서는 다른 탭을 활성화할 수 없으므로,
-  //    페이지가 "창 다 열었다"는 신호(postMessage)를 보내면 확장(background.js)에 전달해 실행 탭으로 되돌린다
+  // 💡 [실행 탭 → 확장 브리지] 페이지(MAIN)에서는 확장 API를 쓸 수 없으므로,
+  //    페이지가 보내는 신호(postMessage)를 확장(background.js)에 전달한다
+  //    - MANGO_FOCUS_RUNNER : 창을 다 열었으니 실행 탭으로 되돌려 달라
+  //    - MANGO_SSG_CAPTCHA  : 작업 창에서 SSG 로그인/CAPTCHA 알림이 떴으니 재로그인 후 그 창들을 닫아 달라
   await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     func: () => {
-      if (window.__mangoFocusBridge) return; // 중복 등록 방지
-      window.__mangoFocusBridge = true;
+      if (window.__mangoBridgeVer >= 2) return; // 중복 등록 방지 (예전 브리지가 있어도 새 신호를 받도록 버전으로 구분)
+      window.__mangoBridgeVer = 2;
+      const MAP = { MANGO_FOCUS_RUNNER: 'mango_focus_runner', MANGO_SSG_CAPTCHA: 'mango_ssg_captcha' };
       window.addEventListener('message', (e) => {
-        if (e.source === window && e.data && e.data.type === 'MANGO_FOCUS_RUNNER') {
-          chrome.runtime.sendMessage({ type: 'mango_focus_runner' });
-        }
+        if (e.source !== window || !e.data) return;
+        const type = MAP[e.data.type];
+        if (type) chrome.runtime.sendMessage({ type });
       });
     }
   });

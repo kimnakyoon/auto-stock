@@ -172,6 +172,11 @@ chrome.windows.onRemoved.addListener(async (winId) => {
 //    SSG 로그인 화면 탭이 따로 더 열려 있으면(확인용 탭 제외) 그 탭들만 닫는다. 다른 SSG 탭은 건드리지 않는다.
 //    chrome.alarms + 백그라운드에서 돌기 때문에 다른 창이 선택되어 있어도
 //    동작하고, 창을 앞으로 가져오지 않는다.
+//
+//    [작업 창 CAPTCHA 정리] 로그인이 풀린 채 작업하면 더망고 작업 창에 "로그인 페이지 또는 CAPTCHA 페이지입니다"
+//    알림이 뜨며 멈춘다. 실행 탭이 그 신호(mango_ssg_captcha)를 보내오면 로그인 확인/재로그인을 한 뒤,
+//    로그인이 되어 있을 때만 (1) 알림이 뜬 작업 창(mycafe24)과 (2) 작업 창이 배열에 맞춰 띄운 SSG 팝업창을 모두 닫는다.
+//    실행 탭은 창이 닫힌 것을 보고 같은 구간을 새 창으로 다시 실행한다.
 // ═══════════════════════════════════════════════════════════════
 const SSG_ALARM = 'mango_ssg_check';
 const SSG_CHECK_MINUTES = 60;                       // 안전장치용 로그인 확인 주기 (1시간)
@@ -385,6 +390,75 @@ async function ssgCheck(reason) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 💡 작업 창 CAPTCHA 정리 (실행 탭의 mango_ssg_captcha 신호로 실행)
+// ═══════════════════════════════════════════════════════════════
+const MANGO_TAB_MATCH = ['*://*.mycafe24.com/*'];
+
+// 작업 창(mycafe24 탭) 중 CAPTCHA 알림 표식(__MANGO_CAPTCHA, 훅이 alert 를 가로채며 남김)이 있는 탭 번호 목록
+async function ssgFindCaptchaTabs() {
+    let tabs = [];
+    try { tabs = await chrome.tabs.query({ url: MANGO_TAB_MATCH }); } catch (e) { return []; }
+    const found = [];
+    for (const t of tabs) {
+        try {
+            const [r] = await chrome.scripting.executeScript({
+                target: { tabId: t.id }, world: 'MAIN', func: () => !!window.__MANGO_CAPTCHA
+            });
+            if (r && r.result) found.push(t.id);
+        } catch (e) { /* 로딩 중이거나 접근 불가한 탭은 건너뜀 */ }
+    }
+    return found;
+}
+
+// 💡 CAPTCHA 가 뜬 작업 창과, 작업 창이 배열에 맞춰 띄운 SSG 팝업창을 모두 닫는다
+//    팝업창: type 이 popup 인 창 중 SSG 주소이거나 CAPTCHA 작업 창이 연 창 (about:blank 로 남은 창 포함)
+//    확인용 SSG 탭은 일반 탭이라 여기에 해당하지 않는다
+async function ssgCloseCaptchaWindows(captchaTabs) {
+    const isCaptchaOpener = new Set(captchaTabs);
+    let popups = 0;
+    try {
+        const wins = await chrome.windows.getAll({ populate: true, windowTypes: ['popup'] });
+        for (const w of wins) {
+            const tabs = w.tabs || [];
+            const hit = tabs.some(t => isSsgUrl(t.url) || isCaptchaOpener.has(t.openerTabId));
+            if (!hit) continue;
+            try { await chrome.windows.remove(w.id); popups++; } catch (e) { /* 이미 닫힘 */ }
+        }
+    } catch (e) {}
+    if (captchaTabs.length) {
+        try { await chrome.tabs.remove(captchaTabs); } catch (e) { /* 이미 닫힘 */ }
+    }
+    await ssgLog(`🧹 CAPTCHA 작업 창 ${captchaTabs.length}개, 배열 SSG 팝업창 ${popups}개를 닫음 → 실행 탭이 해당 구간을 다시 실행`);
+}
+
+let ssgCaptchaPending = false;
+async function ssgCaptchaRecover() {
+    if (ssgCaptchaPending) return;   // 처리 중이면 무시 (실행 탭이 1분 뒤 다시 신호를 보낸다)
+    ssgCaptchaPending = true;
+    try {
+        if (!(await ssgGetState()).running) {
+            await ssgLog('⚠️ 작업 창에 SSG 로그인/CAPTCHA 알림이 떴지만 SSG 자동 재로그인이 꺼져 있어 처리하지 않음 (SSG 로그인 실행을 눌러 주세요)');
+            return;
+        }
+        await ssgLog('🚨 작업 창에 SSG 로그인/CAPTCHA 알림 감지 → 로그인 확인/재로그인 후 CAPTCHA 창을 정리합니다');
+        while (ssgBusy) await ssgWait(1000);   // 진행 중인 확인이 있으면 끝날 때까지 기다린 뒤 한 번 더 확인
+        await ssgCheck('작업 창 CAPTCHA 감지');
+
+        const st = await ssgGetState();
+        if (!st.loggedIn) {
+            await ssgLog('❌ SSG 로그인이 되지 않아 CAPTCHA 창을 닫지 않음 (로그인 후 실행 탭이 다시 요청함)');
+            return;
+        }
+        const captchaTabs = await ssgFindCaptchaTabs();
+        await ssgCloseCaptchaWindows(captchaTabs);
+    } catch (e) {
+        await ssgLog(`❌ CAPTCHA 정리 오류: ${e.message}`);
+    } finally {
+        ssgCaptchaPending = false;
+    }
+}
+
 async function ssgStart(id, pw) {
     await chrome.alarms.create(SSG_ALARM, { periodInMinutes: SSG_CHECK_MINUTES });
     await ssgLog(`▶ SSG 자동 재로그인 시작 (로그인 화면/로그인 표시가 보이면 즉시 + ${SSG_CHECK_MINUTES}분마다 열어 둔 SSG 탭에서 확인)`,
@@ -436,6 +510,7 @@ async function focusTab(tab) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || typeof msg.type !== 'string') return;
     if (msg.type === 'mango_focus_runner') { if (sender.tab) focusTab(sender.tab); return; }
+    if (msg.type === 'mango_ssg_captcha') { ssgCaptchaRecover(); return; }
     if (!msg.type.startsWith('ssg_')) return;
     (async () => {
         if (msg.type === 'ssg_start') await ssgStart(msg.id, msg.pw);

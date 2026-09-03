@@ -142,6 +142,20 @@ function mangoAutoLoop(CFG) {
             if (window.__MANGO_HOOKED) return; // 중복 주입 방지
             window.__MANGO_HOOKED = true;
 
+            // 💡 SSG 로그인이 풀리면 더망고가 "로그인 페이지 또는 CAPTCHA 페이지입니다" alert 를 띄우며 이 창이 막힌다.
+            //    대화상자는 띄우지 않고 표식(__MANGO_CAPTCHA)만 남긴다 → 실행 탭이 이 표식을 보고
+            //    확장에 SSG 재로그인을 요청하고, 확장이 이 창을 닫으면 같은 구간을 새 창으로 다시 실행한다.
+            const nativeAlert = window.alert.bind(window);
+            window.alert = function(msg) {
+                const s = (msg === undefined || msg === null) ? '' : String(msg);
+                if (/CAPTCHA|로그인페이지/i.test(s.replace(/\\s+/g, ''))) {
+                    window.__MANGO_CAPTCHA = s;
+                    console.warn('[mango] SSG 로그인/CAPTCHA 알림 감지 (창이 막히지 않도록 대화상자는 띄우지 않음):', s);
+                    return;
+                }
+                return nativeAlert(msg);
+            };
+
             const originalOpen = window.open;
             const tracked = []; // 열린 팝업 감시 목록 (로딩 지연 에러 자동 재시도용)
             const P_WIDTH = 220, P_HEIGHT = 120, Y_STEP = 65;
@@ -309,7 +323,32 @@ function mangoAutoLoop(CFG) {
 
     // 💡 [실행 탭 복귀] 새 작업 탭들이 앞으로 나오면서 이 탭(작업 로그가 보이는 실행 탭)이 가려지므로,
     //    창을 다 연 뒤 확장(popup.js가 심어둔 브리지 → background.js)에 신호를 보내 이 탭으로 되돌아온다
-    const focusRunner = () => { try { window.postMessage({ type: 'MANGO_FOCUS_RUNNER' }, location.origin); } catch (e) {} };
+    const signalExt = (type) => { try { window.postMessage({ type }, location.origin); } catch (e) {} };
+    const focusRunner = () => signalExt('MANGO_FOCUS_RUNNER');
+    // 💡 [SSG CAPTCHA] 작업 창에서 SSG 로그인/CAPTCHA 알림이 감지되면 확장(background.js)에 알린다
+    //    → 확장이 SSG 재로그인을 하고, 성공하면 CAPTCHA 가 뜬 작업 창과 배열에 맞춰 뜬 SSG 팝업창을 모두 닫는다
+    const notifyCaptcha = () => signalExt('MANGO_SSG_CAPTCHA');
+    const CAPTCHA_NOTIFY_MS = 60000; // 확장이 아직 안 닫아 줬으면 이 간격으로 다시 알린다
+
+    // 💡 작업 창을 닫고(이미 닫혔으면 그대로) 같은 구간으로 새 창을 열어 처음부터 다시 실행한다
+    //    "전송을 종료합니다" 조기 종료, SSG CAPTCHA 창이 닫힌 경우에 사용. 창을 못 열면 false
+    function reopenWorker(t) {
+        try { if (!t.win.closed) t.win.close(); } catch (e) {}
+        const nw = window.open(MAIN_URL, '_blank');
+        if (!nw) {
+            t.done = true;
+            log(`⚠️ [${t.start}~${t.end}] 재실행 창을 열지 못했습니다. (팝업 차단 확인)`);
+            return false;
+        }
+        nw.opener = null;
+        t.win = nw;
+        t.ready = false;
+        t.captcha = false;
+        t.captchaAt = 0;
+        startWorkerSetup(t);
+        focusRunner(); // 재실행 창이 앞으로 나오므로 실행 탭으로 되돌아온다
+        return true;
+    }
 
     async function runCycle() {
         log('🔄 사이클 시작 - 전체 수량 파악용 임시 탭을 엽니다.');
@@ -349,7 +388,7 @@ function mangoAutoLoop(CFG) {
             const end = Math.min(start + batchSize - 1, endLimit);
 
             const w = window.open(MAIN_URL, '_blank');
-            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, lastRetry: 0, retryCount: 0 };
+            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, lastRetry: 0, retryCount: 0, captcha: false, captchaAt: 0 };
             workers.push(t);
 
             if (!w) { // 창 자체가 안 열리면(팝업 차단 등) 이 구간은 건너뛰어 사이클이 영원히 멈추지 않게 함
@@ -382,7 +421,18 @@ function mangoAutoLoop(CFG) {
             for (const t of workers) {
                 if (t.done) continue;
                 try {
-                    if (t.win.closed) { t.done = true; continue; }
+                    if (t.win.closed) {
+                        // 💡 CAPTCHA 감지 후 닫힌 창(확장이 SSG 재로그인 뒤 닫음, 또는 사용자가 닫음) → 같은 구간 재실행
+                        if (t.captcha) {
+                            allFinished = false;
+                            t.captchaCount = (t.captchaCount || 0) + 1;
+                            log(`🔁 [${t.start}~${t.end}] CAPTCHA 창이 닫힘 → 같은 구간 재실행 ${t.captchaCount}회차`);
+                            reopenWorker(t);
+                            continue;
+                        }
+                        t.done = true;
+                        continue;
+                    }
 
                     // 💡 작업 시작 후 에러 페이지가 뜨면 → 재접속하고 해당 구간을 처음부터 재시작
                     //    (세팅 중이면 startWorkerSetup 쪽에서 이미 처리하므로 setupIt이 없을 때만)
@@ -398,6 +448,19 @@ function mangoAutoLoop(CFG) {
                         continue;
                     }
 
+                    // 💡 SSG 로그인/CAPTCHA 알림 표식(훅이 alert 를 가로채며 남김) 감지
+                    //    → 확장에 알리고, 확장이 SSG 재로그인 뒤 이 창을 닫아 줄 때까지 기다린다 (닫히면 위에서 재실행)
+                    if (!t.setupIt && t.win.__MANGO_CAPTCHA) {
+                        allFinished = false;
+                        if (!t.captcha) {
+                            t.captcha = true;
+                            t.captchaAt = 0;
+                            log(`⚠️ [${t.start}~${t.end}] SSG 로그인/CAPTCHA 감지 → 확장에 SSG 재로그인 요청 (로그인 후 창을 닫고 재실행)`);
+                        }
+                        if (Date.now() - t.captchaAt > CAPTCHA_NOTIFY_MS) { t.captchaAt = Date.now(); notifyCaptcha(); }
+                        continue;
+                    }
+
                     // 진행 메시지 영역(layer_page)을 한 번만 읽어 "전송 종료"와 "완료"를 함께 판정
                     const layer = (t.win.document.getElementById('layer_page')?.innerText || '').replace(/\s+/g, '');
 
@@ -406,19 +469,7 @@ function mangoAutoLoop(CFG) {
                         allFinished = false;
                         t.abortCount = (t.abortCount || 0) + 1;
                         log(`⚠️ [${t.start}~${t.end}] 전송 종료 문구 감지 → 창 닫고 재실행 ${t.abortCount}회차`);
-                        try { t.win.close(); } catch (e) {}
-
-                        const nw = window.open(MAIN_URL, '_blank');
-                        if (!nw) {
-                            t.done = true;
-                            log(`⚠️ [${t.start}~${t.end}] 재실행 창을 열지 못했습니다. (팝업 차단 확인)`);
-                            continue;
-                        }
-                        nw.opener = null;
-                        t.win = nw;
-                        t.ready = false;
-                        startWorkerSetup(t);
-                        focusRunner(); // 재실행 창이 앞으로 나오므로 실행 탭으로 되돌아온다
+                        reopenWorker(t);
                         continue;
                     }
 
