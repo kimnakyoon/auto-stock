@@ -120,6 +120,9 @@ function mangoAutoLoop(CFG) {
     //    ("전송가능한 업데이트 또는 마켓이 없습니다. 전송을 종료합니다.")
     const ABORT_TEXT = '전송을 종료합니다';
     const normalizedAbort = ABORT_TEXT.replace(/\s+/g, '');
+    // 💡 SSG 로그인이 풀린 채 작업하면 작업 창에 뜨는 alert 문구
+    //    ("로그인 페이지 또는 CAPTCHA 페이지입니다. 로그인 또는 CAPTCHA 해제 후에 ... 다시 진행하시기 바랍니다.")
+    const CAPTCHA_TEXT = 'CAPTCHA';
 
     // 💡 카페24 서버 과부하 시 뜨는 "페이지 로딩이 잠시 지연되었습니다" 에러 페이지 감지
     function isErrorPage(win) {
@@ -147,13 +150,10 @@ function mangoAutoLoop(CFG) {
             //    확장에 SSG 재로그인을 요청하고, 확장이 이 창을 닫으면 같은 구간을 새 창으로 다시 실행한다.
             const nativeAlert = window.alert.bind(window);
             window.alert = function(msg) {
-                const s = (msg === undefined || msg === null) ? '' : String(msg);
-                if (/CAPTCHA|로그인페이지/i.test(s.replace(/\\s+/g, ''))) {
-                    window.__MANGO_CAPTCHA = s;
-                    console.warn('[mango] SSG 로그인/CAPTCHA 알림 감지 (창이 막히지 않도록 대화상자는 띄우지 않음):', s);
-                    return;
-                }
-                return nativeAlert(msg);
+                const s = String(msg ?? '');
+                if (s.indexOf('${CAPTCHA_TEXT}') === -1) return nativeAlert(msg);
+                window.__MANGO_CAPTCHA = s;
+                console.warn('[mango] SSG 로그인/CAPTCHA 알림 감지 (창이 막히지 않도록 대화상자는 띄우지 않음):', s);
             };
 
             const originalOpen = window.open;
@@ -323,31 +323,28 @@ function mangoAutoLoop(CFG) {
 
     // 💡 [실행 탭 복귀] 새 작업 탭들이 앞으로 나오면서 이 탭(작업 로그가 보이는 실행 탭)이 가려지므로,
     //    창을 다 연 뒤 확장(popup.js가 심어둔 브리지 → background.js)에 신호를 보내 이 탭으로 되돌아온다
+    //    같은 브리지로 MANGO_SSG_CAPTCHA 도 보낸다: 작업 창에 SSG 로그인/CAPTCHA 알림이 떴으니
+    //    확장이 SSG 재로그인을 하고, 성공하면 CAPTCHA 가 뜬 작업 창과 배열에 맞춰 뜬 SSG 팝업창을 모두 닫아 달라는 신호
     const signalExt = (type) => { try { window.postMessage({ type }, location.origin); } catch (e) {} };
     const focusRunner = () => signalExt('MANGO_FOCUS_RUNNER');
-    // 💡 [SSG CAPTCHA] 작업 창에서 SSG 로그인/CAPTCHA 알림이 감지되면 확장(background.js)에 알린다
-    //    → 확장이 SSG 재로그인을 하고, 성공하면 CAPTCHA 가 뜬 작업 창과 배열에 맞춰 뜬 SSG 팝업창을 모두 닫는다
-    const notifyCaptcha = () => signalExt('MANGO_SSG_CAPTCHA');
     const CAPTCHA_NOTIFY_MS = 60000; // 확장이 아직 안 닫아 줬으면 이 간격으로 다시 알린다
 
     // 💡 작업 창을 닫고(이미 닫혔으면 그대로) 같은 구간으로 새 창을 열어 처음부터 다시 실행한다
-    //    "전송을 종료합니다" 조기 종료, SSG CAPTCHA 창이 닫힌 경우에 사용. 창을 못 열면 false
+    //    "전송을 종료합니다" 조기 종료, SSG CAPTCHA 창이 닫힌 경우에 사용
     function reopenWorker(t) {
-        try { if (!t.win.closed) t.win.close(); } catch (e) {}
+        try { t.win.close(); } catch (e) {}
         const nw = window.open(MAIN_URL, '_blank');
         if (!nw) {
             t.done = true;
             log(`⚠️ [${t.start}~${t.end}] 재실행 창을 열지 못했습니다. (팝업 차단 확인)`);
-            return false;
+            return;
         }
         nw.opener = null;
         t.win = nw;
         t.ready = false;
-        t.captcha = false;
         t.captchaAt = 0;
         startWorkerSetup(t);
         focusRunner(); // 재실행 창이 앞으로 나오므로 실행 탭으로 되돌아온다
-        return true;
     }
 
     async function runCycle() {
@@ -388,7 +385,8 @@ function mangoAutoLoop(CFG) {
             const end = Math.min(start + batchSize - 1, endLimit);
 
             const w = window.open(MAIN_URL, '_blank');
-            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, lastRetry: 0, retryCount: 0, captcha: false, captchaAt: 0 };
+            // captchaAt: SSG 로그인/CAPTCHA 알림을 감지한 시각 (0 이면 감지 안 됨), 확장에 마지막으로 알린 시각으로도 쓴다
+            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, lastRetry: 0, retryCount: 0, abortCount: 0, captchaAt: 0, captchaCount: 0 };
             workers.push(t);
 
             if (!w) { // 창 자체가 안 열리면(팝업 차단 등) 이 구간은 건너뛰어 사이클이 영원히 멈추지 않게 함
@@ -418,14 +416,17 @@ function mangoAutoLoop(CFG) {
 
         const monitorIt = bgTimer.setInterval(() => {
             let allFinished = true;
+            let reopened = false; // 💡 처음 열 때처럼 재실행 창도 한 번(10초)에 하나씩만 연다 (한꺼번에 열면 로딩 지연 유발)
             for (const t of workers) {
                 if (t.done) continue;
                 try {
                     if (t.win.closed) {
                         // 💡 CAPTCHA 감지 후 닫힌 창(확장이 SSG 재로그인 뒤 닫음, 또는 사용자가 닫음) → 같은 구간 재실행
-                        if (t.captcha) {
+                        if (t.captchaAt) {
                             allFinished = false;
-                            t.captchaCount = (t.captchaCount || 0) + 1;
+                            if (reopened) continue;
+                            reopened = true;
+                            t.captchaCount++;
                             log(`🔁 [${t.start}~${t.end}] CAPTCHA 창이 닫힘 → 같은 구간 재실행 ${t.captchaCount}회차`);
                             reopenWorker(t);
                             continue;
@@ -452,12 +453,8 @@ function mangoAutoLoop(CFG) {
                     //    → 확장에 알리고, 확장이 SSG 재로그인 뒤 이 창을 닫아 줄 때까지 기다린다 (닫히면 위에서 재실행)
                     if (!t.setupIt && t.win.__MANGO_CAPTCHA) {
                         allFinished = false;
-                        if (!t.captcha) {
-                            t.captcha = true;
-                            t.captchaAt = 0;
-                            log(`⚠️ [${t.start}~${t.end}] SSG 로그인/CAPTCHA 감지 → 확장에 SSG 재로그인 요청 (로그인 후 창을 닫고 재실행)`);
-                        }
-                        if (Date.now() - t.captchaAt > CAPTCHA_NOTIFY_MS) { t.captchaAt = Date.now(); notifyCaptcha(); }
+                        if (!t.captchaAt) log(`⚠️ [${t.start}~${t.end}] SSG 로그인/CAPTCHA 감지 → 확장에 SSG 재로그인 요청 (로그인 후 창을 닫고 재실행)`);
+                        if (Date.now() - t.captchaAt > CAPTCHA_NOTIFY_MS) { t.captchaAt = Date.now(); signalExt('MANGO_SSG_CAPTCHA'); }
                         continue;
                     }
 
@@ -467,7 +464,9 @@ function mangoAutoLoop(CFG) {
                     // 💡 "전송을 종료합니다" 조기 종료 → 해당 창만 닫고 같은 구간으로 새 창을 열어 다시 실행
                     if (!t.setupIt && layer.includes(normalizedAbort)) {
                         allFinished = false;
-                        t.abortCount = (t.abortCount || 0) + 1;
+                        if (reopened) continue;
+                        reopened = true;
+                        t.abortCount++;
                         log(`⚠️ [${t.start}~${t.end}] 전송 종료 문구 감지 → 창 닫고 재실행 ${t.abortCount}회차`);
                         reopenWorker(t);
                         continue;

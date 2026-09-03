@@ -213,10 +213,10 @@ function ssgPageState() {
         loginHref: link ? link.href : '',
     };
 }
-// 탭에서 ssgPageState 를 실행한다 (실행 못 하면 null)
-async function ssgProbe(tabId) {
+// 탭에서 func 를 실행해 결과를 돌려준다 (기본: ssgPageState, 실행 못 하면 null)
+async function ssgProbe(tabId, func = ssgPageState, world) {
     try {
-        const [r] = await chrome.scripting.executeScript({ target: { tabId }, func: ssgPageState });
+        const [r] = await chrome.scripting.executeScript({ target: { tabId }, func, world });
         return (r && r.result) || null;
     } catch (e) { return null; }
 }
@@ -263,9 +263,9 @@ async function ssgSettle(tabId, checkNow) {
 // 탭의 현재 주소를 돌려준다 (탭이 닫혀 있으면 null)
 const ssgTabUrl = (tabId) => chrome.tabs.get(tabId).then(t => t.url || '').catch(() => null);
 
-// 지금 열려 있는 SSG 탭 목록
-async function ssgListTabs() {
-    try { return await chrome.tabs.query({ url: SSG_TAB_MATCH }); } catch (e) { return []; }
+// 지금 열려 있는 탭 목록 (기본: SSG 탭)
+async function ssgListTabs(match = SSG_TAB_MATCH) {
+    try { return await chrome.tabs.query({ url: match }); } catch (e) { return []; }
 }
 
 // 💡 확인용 SSG 탭을 구한다 (항상 같은 탭을 재사용)
@@ -321,12 +321,16 @@ function ssgFillAndSubmit(id, pw) {
     return { ok: false, reason: '로그인 버튼을 찾지 못함' };
 }
 
-let ssgBusy = false;
-async function ssgCheck(reason) {
-    if (ssgBusy) return;
-    ssgBusy = true;
-    const fail = (msg) => ssgLog(`❌ ${msg} (탭은 그대로 둠)`, { lastCheck: Date.now(), loggedIn: false });
-    const ok = (msg) => ssgLog(`✅ ${msg} (탭은 그대로 둠)`, { lastCheck: Date.now(), loggedIn: true });
+// 💡 확인은 한 번에 하나만 돈다. 진행 중이면 그 확인(프로미스)을 그대로 돌려주므로
+//    호출한 쪽은 await 로 결과(true=로그인됨, false=안 됨, undefined=판단 못 함)를 받을 수 있다.
+let ssgInflight = null;
+function ssgCheck(reason) {
+    if (!ssgInflight) ssgInflight = ssgRunCheck(reason).finally(() => { ssgInflight = null; });
+    return ssgInflight;
+}
+async function ssgRunCheck(reason) {
+    const fail = async (msg) => { await ssgLog(`❌ ${msg} (탭은 그대로 둠)`, { lastCheck: Date.now(), loggedIn: false }); return false; };
+    const ok = async (msg) => { await ssgLog(`✅ ${msg} (탭은 그대로 둠)`, { lastCheck: Date.now(), loggedIn: true }); return true; };
     try {
         const st = await ssgGetState();
         if (!st.running) return;
@@ -348,10 +352,10 @@ async function ssgCheck(reason) {
         if (url === null) { await ssgLog('⚠️ 확인용 탭이 도중에 닫혀 이번 확인을 건너뜁니다.'); return; }
         const page = await ssgProbe(tabId);
         const onLoginPage = isSsgLoginUrl(url) || !!(page && page.hasPwInput);
-        if (!onLoginPage && !ssgLoggedOut(page)) { await ok('SSG 로그인 유지 중'); return; }
+        if (!onLoginPage && !ssgLoggedOut(page)) return ok('SSG 로그인 유지 중');
 
         await ssgLog(`⚠️ 로그인이 풀려 있음 (${onLoginPage ? '로그인 화면' : '화면에 로그인 표시'}) → 같은 탭에서 자동 로그인 시도`);
-        if (!st.id || !st.pw) { await fail('아이디/비밀번호가 저장되어 있지 않아 로그인할 수 없습니다.'); return; }
+        if (!st.id || !st.pw) return fail('아이디/비밀번호가 저장되어 있지 않아 로그인할 수 없습니다.');
 
         // 5) 로그인 화면이 아니면(로그아웃해도 주소가 안 바뀐 경우) "로그인" 링크 주소로, 없으면 기본 로그인 주소로 이동
         if (!onLoginPage) {
@@ -370,7 +374,7 @@ async function ssgCheck(reason) {
                 res = r && r.result;
             } catch (e) { res = { ok: false, reason: e.message }; }
         }
-        if (!res || !res.ok) { await fail(`자동 로그인 실패: ${(res && res.reason) || '스크립트 실행 오류'}`); return; }
+        if (!res || !res.ok) return fail(`자동 로그인 실패: ${(res && res.reason) || '스크립트 실행 오류'}`);
 
         // 로그인 처리 대기 (최대 30초): 로그인 화면에서 벗어나고 화면에 로그인 표시도 없으면 성공
         for (let i = 0; i < 20; i++) {
@@ -379,15 +383,14 @@ async function ssgCheck(reason) {
             if (u === null) break;
             if (isSsgLoginUrl(u)) continue;
             await ssgWait(1500); // 이동한 화면이 그려질 시간
-            if (ssgLoggedOut(await ssgProbe(tabId))) { await fail('로그인 화면에서는 벗어났지만 화면에 아직 로그인 표시가 있음 (비밀번호 확인 필요)'); return; }
-            await ok('SSG 자동 로그인 성공'); return;
+            if (ssgLoggedOut(await ssgProbe(tabId))) return fail('로그인 화면에서는 벗어났지만 화면에 아직 로그인 표시가 있음 (비밀번호 확인 필요)');
+            return ok('SSG 자동 로그인 성공');
         }
-        await fail('로그인 버튼을 눌렀지만 로그인 화면에서 벗어나지 못함 (비밀번호/보안문자 확인 필요)');
+        return fail('로그인 버튼을 눌렀지만 로그인 화면에서 벗어나지 못함 (비밀번호/보안문자 확인 필요)');
     } catch (e) {
         await ssgLog(`❌ 오류: ${e.message}`);
-    } finally {
-        ssgBusy = false;   // 💡 탭은 어떤 경우에도 닫지 않고 그대로 둔다
     }
+    // 💡 탭은 어떤 경우에도 닫지 않고 그대로 둔다
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -396,19 +399,12 @@ async function ssgCheck(reason) {
 const MANGO_TAB_MATCH = ['*://*.mycafe24.com/*'];
 
 // 작업 창(mycafe24 탭) 중 CAPTCHA 알림 표식(__MANGO_CAPTCHA, 훅이 alert 를 가로채며 남김)이 있는 탭 번호 목록
+//    탭마다 표식을 읽는 작업은 서로 독립이므로 한꺼번에 실행한다
+const hasCaptchaMark = () => !!window.__MANGO_CAPTCHA;
 async function ssgFindCaptchaTabs() {
-    let tabs = [];
-    try { tabs = await chrome.tabs.query({ url: MANGO_TAB_MATCH }); } catch (e) { return []; }
-    const found = [];
-    for (const t of tabs) {
-        try {
-            const [r] = await chrome.scripting.executeScript({
-                target: { tabId: t.id }, world: 'MAIN', func: () => !!window.__MANGO_CAPTCHA
-            });
-            if (r && r.result) found.push(t.id);
-        } catch (e) { /* 로딩 중이거나 접근 불가한 탭은 건너뜀 */ }
-    }
-    return found;
+    const tabs = await ssgListTabs(MANGO_TAB_MATCH);
+    const marks = await Promise.all(tabs.map(t => ssgProbe(t.id, hasCaptchaMark, 'MAIN')));
+    return tabs.filter((t, i) => marks[i]).map(t => t.id);
 }
 
 // 💡 CAPTCHA 가 뜬 작업 창과, 작업 창이 배열에 맞춰 띄운 SSG 팝업창을 모두 닫는다
@@ -416,42 +412,41 @@ async function ssgFindCaptchaTabs() {
 //    확인용 SSG 탭은 일반 탭이라 여기에 해당하지 않는다
 async function ssgCloseCaptchaWindows(captchaTabs) {
     const isCaptchaOpener = new Set(captchaTabs);
-    let popups = 0;
-    try {
-        const wins = await chrome.windows.getAll({ populate: true, windowTypes: ['popup'] });
-        for (const w of wins) {
-            const tabs = w.tabs || [];
-            const hit = tabs.some(t => isSsgUrl(t.url) || isCaptchaOpener.has(t.openerTabId));
-            if (!hit) continue;
-            try { await chrome.windows.remove(w.id); popups++; } catch (e) { /* 이미 닫힘 */ }
-        }
-    } catch (e) {}
+    let wins = [];
+    try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ['popup'] }); } catch (e) {}
+    const popupIds = wins
+        .filter(w => (w.tabs || []).some(t => isSsgUrl(t.url) || isCaptchaOpener.has(t.openerTabId)))
+        .map(w => w.id);
+    // 창 닫기는 서로 독립이므로 한꺼번에 (이미 닫힌 창은 무시)
+    const closed = await Promise.all(popupIds.map(id => chrome.windows.remove(id).then(() => 1, () => 0)));
+    const popups = closed.reduce((a, b) => a + b, 0);
     if (captchaTabs.length) {
         try { await chrome.tabs.remove(captchaTabs); } catch (e) { /* 이미 닫힘 */ }
     }
     await ssgLog(`🧹 CAPTCHA 작업 창 ${captchaTabs.length}개, 배열 SSG 팝업창 ${popups}개를 닫음 → 실행 탭이 해당 구간을 다시 실행`);
 }
 
+// 실행 탭은 창이 안 닫히면 1분마다 다시 신호를 보내므로, 처리 중이면 무시하고 꺼짐 경고도 자주 남기지 않는다
+const SSG_CAPTCHA_WARN_COOLDOWN_MS = 10 * 60 * 1000;
 let ssgCaptchaPending = false;
+let ssgCaptchaWarnedAt = 0;
 async function ssgCaptchaRecover() {
-    if (ssgCaptchaPending) return;   // 처리 중이면 무시 (실행 탭이 1분 뒤 다시 신호를 보낸다)
+    if (ssgCaptchaPending) return;
     ssgCaptchaPending = true;
     try {
         if (!(await ssgGetState()).running) {
+            if (Date.now() - ssgCaptchaWarnedAt < SSG_CAPTCHA_WARN_COOLDOWN_MS) return;
+            ssgCaptchaWarnedAt = Date.now();
             await ssgLog('⚠️ 작업 창에 SSG 로그인/CAPTCHA 알림이 떴지만 SSG 자동 재로그인이 꺼져 있어 처리하지 않음 (SSG 로그인 실행을 눌러 주세요)');
             return;
         }
         await ssgLog('🚨 작업 창에 SSG 로그인/CAPTCHA 알림 감지 → 로그인 확인/재로그인 후 CAPTCHA 창을 정리합니다');
-        while (ssgBusy) await ssgWait(1000);   // 진행 중인 확인이 있으면 끝날 때까지 기다린 뒤 한 번 더 확인
-        await ssgCheck('작업 창 CAPTCHA 감지');
-
-        const st = await ssgGetState();
-        if (!st.loggedIn) {
-            await ssgLog('❌ SSG 로그인이 되지 않아 CAPTCHA 창을 닫지 않음 (로그인 후 실행 탭이 다시 요청함)');
+        // 진행 중인 확인이 있으면 그 결과를 같이 받고, 없으면 새로 확인한다
+        if (!(await ssgCheck('작업 창 CAPTCHA 감지'))) {
+            await ssgLog('❌ SSG 로그인이 확인되지 않아 CAPTCHA 창을 닫지 않음 (실행 탭이 1분 뒤 다시 요청함)');
             return;
         }
-        const captchaTabs = await ssgFindCaptchaTabs();
-        await ssgCloseCaptchaWindows(captchaTabs);
+        await ssgCloseCaptchaWindows(await ssgFindCaptchaTabs());
     } catch (e) {
         await ssgLog(`❌ CAPTCHA 정리 오류: ${e.message}`);
     } finally {
@@ -479,21 +474,21 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // 💡 로그아웃 즉시 감지: 어떤 SSG 탭이든
 //    (1) 주소가 로그인 화면으로 바뀌거나
 //    (2) 로딩이 끝난 화면 안에 "로그인" 표시가 있으면(로그아웃해도 주소가 안 바뀌는 경우) 바로 확인을 돌린다.
-//    확인 중(ssgBusy)이면 확인용 탭이 움직이는 것이므로 무시하고,
+//    확인 중(ssgInflight)이면 확인용 탭이 움직이는 것이므로 무시하고,
 //    감지로 한 번 돌린 뒤 SSG_EVENT_COOLDOWN_MS 안에는 다시 돌리지 않는다 (실패 반복 방지).
 let ssgEventLast = 0;
 function ssgTrigger(reason) {
-    if (ssgBusy || Date.now() - ssgEventLast < SSG_EVENT_COOLDOWN_MS) return;
+    if (ssgInflight || Date.now() - ssgEventLast < SSG_EVENT_COOLDOWN_MS) return;
     ssgEventLast = Date.now();
     ssgCheck(reason);
 }
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
-    if (ssgBusy) return;
+    if (ssgInflight) return;
     if (isSsgLoginUrl(info.url)) { ssgTrigger('로그인 화면 감지'); return; }
     if (info.status !== 'complete' || !isSsgUrl(tab && tab.url)) return;
     if (!(await ssgGetState()).running) return;
     await ssgWait(1500); // 상단 메뉴가 그려질 시간
-    if (ssgBusy) return;
+    if (ssgInflight) return;
     if (ssgLoggedOut(await ssgProbe(tabId))) ssgTrigger('화면에 로그인 표시 감지');
 });
 
