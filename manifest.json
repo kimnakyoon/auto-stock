@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "더망고 자동화 매크로",
-  "version": "13.7",
-  "description": "로딩 지연 에러 자동 재시도, 전송 종료 창 자동 재실행, SSG 자동 재로그인(새 탭으로 마이페이지 확인), 팝업 창 위치 강제 고정, 창 순차 오픈",
+  "version": "13.8",
+  "description": "로딩 지연 에러 자동 재시도, 전송 종료 창 자동 재실행, SSG 자동 재로그인(SSG 탭 하나를 유지하며 마이페이지 확인, 여분 SSG 탭 정리), 팝업 창 위치 강제 고정, 창 순차 오픈",
   "action": {
     "default_popup": "popup.html"
   },

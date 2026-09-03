@@ -129,7 +129,7 @@ function renderSsgStatus(st) {
   const btn = document.getElementById('btnSsgStart');
   if (!st) { box.textContent = '상태: 꺼짐'; btn.textContent = 'SSG 로그인 실행'; return; }
   const head = st.running
-    ? '상태: 실행 중 (1시간마다 새 탭으로 마이페이지 확인)'
+    ? '상태: 실행 중 (1시간마다 열어 둔 SSG 탭에서 마이페이지 확인)'
     : '상태: 꺼짐';
   const lines = (st.log || []).slice(-3).join('\n');
   box.textContent = lines ? `${head}\n${lines}` : head;
@@ -158,7 +158,7 @@ document.getElementById('btnSsgStart').addEventListener('click', async () => {
   const pw = document.getElementById('ssgPw').value;
   if (!id || !pw) { alert('SSG 아이디와 비밀번호를 입력해주세요.'); return; }
 
-  // 💡 확인은 background.js 가 매번 새 탭(백그라운드)을 열어서 한다 → 현재 탭은 건드리지 않음
+  // 💡 확인은 background.js 가 SSG 탭 하나를 열어 두고(백그라운드) 그 탭에서 한다 → 현재 탭은 건드리지 않음
   chrome.runtime.sendMessage({ type: 'ssg_start', id, pw }); // 표시 갱신은 storage.onChanged 에서
 });
 
