@@ -164,15 +164,17 @@ chrome.windows.onRemoved.addListener(async (winId) => {
 
 // ═══════════════════════════════════════════════════════════════
 // 💡 SSG 자동 재로그인
-//    팝업에서 "SSG 로그인 실행"을 누른 탭 하나만 사용한다.
-//    1시간마다 그 탭을 SSG 주문목록 주소로 보내서, 로그인 화면으로 넘어가면
-//    저장된 아이디/비밀번호로 자동 로그인한다. chrome.alarms + 백그라운드에서
-//    돌기 때문에 다른 창이 선택되어 있어도 동작하고, 창을 앞으로 가져오지 않는다.
+//    확인할 때마다 새 탭(백그라운드)을 열어 SSG 마이페이지로 들어간다.
+//    로그인 화면으로 넘어가면 저장된 아이디/비밀번호로 자동 로그인한다.
+//    확인이 끝나면(로그인 유지 중 / 로그인 성공) 그 탭은 자동으로 닫고,
+//    로그인에 실패하면 사용자가 직접 처리할 수 있도록 탭을 남겨 둔다.
+//    chrome.alarms + 백그라운드에서 돌기 때문에 다른 창이 선택되어 있어도
+//    동작하고, 창을 앞으로 가져오지 않는다.
 // ═══════════════════════════════════════════════════════════════
 const SSG_ALARM = 'mango_ssg_check';
 const SSG_CHECK_MINUTES = 60;                       // 로그인 확인 주기 (1시간)
-// 로그인이 풀려 있으면 member.ssg.com 로그인 화면으로 넘어가는 주소 (마이페이지 주문목록)
-const SSG_CHECK_URL = 'https://pay.ssg.com/myssg/orderInfo.ssg?viewType=Ssg&page=1';
+// 로그인이 풀려 있으면 member.ssg.com 로그인 화면으로 넘어가는 주소 (마이페이지 메인)
+const SSG_CHECK_URL = 'https://www.ssg.com/myssg/main.ssg';
 const SSG_LOG_MAX = 30;
 
 const isSsgLoginUrl = (url) => /login\.ssg|member\.ssg\.com/i.test(url || '');
@@ -180,7 +182,7 @@ const ssgWait = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function ssgGetState() {
     const r = await chrome.storage.local.get('ssgAuto');
-    return r.ssgAuto || { running: false, tabId: null, id: '', pw: '', log: [] };
+    return r.ssgAuto || { running: false, id: '', pw: '', log: [] };
 }
 // 기록 한 줄을 남기면서 상태(patch)도 같이 저장한다 (storage 쓰기 1회)
 async function ssgLog(msg, patch) {
@@ -203,7 +205,18 @@ function ssgWaitForLoad(tabId, timeout = 30000) {
         const onUpd = (id, info) => { if (id === tabId && info.status === 'complete') finish(); };
         chrome.tabs.onUpdated.addListener(onUpd);
         setTimeout(finish, timeout);
+        // 리스너를 붙이기 전에 이미 로딩이 끝났을 수 있으므로 현재 상태도 한 번 확인
+        chrome.tabs.get(tabId).then(t => { if (t.status === 'complete') finish(); }).catch(finish);
     });
+}
+
+// 탭의 현재 주소를 돌려준다 (탭이 닫혀 있으면 null)
+const ssgTabUrl = (tabId) => chrome.tabs.get(tabId).then(t => t.url || '').catch(() => null);
+
+// 확인용 탭을 조용히 닫는다 (이미 닫혀 있어도 오류 없이 넘어감)
+async function ssgCloseTab(tabId) {
+    if (!tabId) return;
+    try { await chrome.tabs.remove(tabId); } catch (e) { /* 이미 닫힘 */ }
 }
 
 // SSG 로그인 화면에 아이디/비밀번호를 넣고 로그인 버튼을 누른다 (페이지 안에서 실행)
@@ -233,78 +246,71 @@ function ssgFillAndSubmit(id, pw) {
 }
 
 let ssgBusy = false;
+let ssgCheckTabId = null;   // 지금 확인 중인 탭 (중지 버튼을 누르면 같이 닫기 위해 기억)
 async function ssgCheck(reason) {
     if (ssgBusy) return;
     ssgBusy = true;
+    let keepTab = false;    // 로그인 실패 시 사용자가 직접 처리하도록 탭을 남길지
+    const fail = (msg) => { keepTab = true; return ssgLog(`❌ ${msg} (탭을 남겨 둠)`, { lastCheck: Date.now(), loggedIn: false }); };
+    const ok = (msg) => ssgLog(`✅ ${msg} (확인 탭 닫음)`, { lastCheck: Date.now(), loggedIn: true });
     try {
         const st = await ssgGetState();
-        if (!st.running || !st.tabId) return;
+        if (!st.running) return;
 
-        let tab;
-        try { tab = await chrome.tabs.get(st.tabId); }
-        catch (e) {
-            await ssgStop('❌ SSG 로그인용 탭이 닫혀 있어 자동 재로그인을 중지합니다.');
-            return;
-        }
-
-        await ssgLog(`🔍 로그인 상태 확인 시작 (${reason})`);
-        // 다른 창을 건드리지 않도록 active/focused 는 지정하지 않는다
-        const loaded = ssgWaitForLoad(tab.id);
-        await chrome.tabs.update(tab.id, { url: SSG_CHECK_URL });
-        await loaded;
+        await ssgLog(`🔍 로그인 상태 확인 시작 (${reason}) → 새 탭으로 마이페이지 열기`);
+        // 💡 새 탭을 백그라운드로 연다 (active:false → 현재 보고 있는 탭/창을 건드리지 않음)
+        const { id: tabId } = await chrome.tabs.create({ url: SSG_CHECK_URL, active: false });
+        ssgCheckTabId = tabId;
+        await ssgWaitForLoad(tabId);
         await ssgWait(2000); // 자바스크립트 리다이렉트가 자리잡을 시간
 
-        tab = await chrome.tabs.get(tab.id);
-        if (!isSsgLoginUrl(tab.url)) {
-            await ssgLog('✅ SSG 로그인 유지 중', { lastCheck: Date.now(), loggedIn: true });
-            return;
-        }
+        const url = await ssgTabUrl(tabId);
+        if (url === null) { await ssgLog('⚠️ 확인용 탭이 도중에 닫혀 이번 확인을 건너뜁니다.'); return; }
+        if (!isSsgLoginUrl(url)) { await ok('SSG 로그인 유지 중'); return; }
 
         await ssgLog('⚠️ 로그인이 풀려 있음 → 자동 로그인 시도');
-        if (!st.id || !st.pw) { await ssgLog('❌ 아이디/비밀번호가 저장되어 있지 않아 로그인할 수 없습니다.'); return; }
+        if (!st.id || !st.pw) { await fail('아이디/비밀번호가 저장되어 있지 않아 로그인할 수 없습니다.'); return; }
 
-        // 로그인 화면이 아직 완전히 그려지지 않았을 수 있어 입력칸이 나타날 때까지 잠시 대기
+        // 로그인 화면이 아직 완전히 그려지지 않았을 수 있어 입력칸이 나타날 때까지 잠시 대기 (최대 5회)
         let res = null;
-        for (let i = 0; i < 5; i++) {
+        for (let i = 0; i < 5 && !(res && res.ok); i++) {
+            if (i) await ssgWait(1500);
             try {
-                const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: ssgFillAndSubmit, args: [st.id, st.pw] });
+                const [r] = await chrome.scripting.executeScript({ target: { tabId }, func: ssgFillAndSubmit, args: [st.id, st.pw] });
                 res = r && r.result;
             } catch (e) { res = { ok: false, reason: e.message }; }
-            if (res && res.ok) break;
-            await ssgWait(1500);
         }
-        if (!res || !res.ok) {
-            await ssgLog(`❌ 자동 로그인 실패: ${(res && res.reason) || '스크립트 실행 오류'}`, { lastCheck: Date.now(), loggedIn: false });
-            return;
-        }
+        if (!res || !res.ok) { await fail(`자동 로그인 실패: ${(res && res.reason) || '스크립트 실행 오류'}`); return; }
 
         // 로그인 처리 대기 (최대 30초): 로그인 화면에서 벗어나면 성공
         for (let i = 0; i < 20; i++) {
             await ssgWait(1500);
-            try { tab = await chrome.tabs.get(tab.id); } catch (e) { break; }
-            if (!isSsgLoginUrl(tab.url)) {
-                await ssgLog('✅ SSG 자동 로그인 성공', { lastCheck: Date.now(), loggedIn: true });
-                return;
-            }
+            const u = await ssgTabUrl(tabId);
+            if (u === null) break;
+            if (!isSsgLoginUrl(u)) { await ok('SSG 자동 로그인 성공'); return; }
         }
-        await ssgLog('❌ 로그인 버튼을 눌렀지만 로그인 화면에서 벗어나지 못함 (비밀번호/보안문자 확인 필요)', { lastCheck: Date.now(), loggedIn: false });
+        await fail('로그인 버튼을 눌렀지만 로그인 화면에서 벗어나지 못함 (비밀번호/보안문자 확인 필요)');
     } catch (e) {
         await ssgLog(`❌ 오류: ${e.message}`);
     } finally {
+        if (!keepTab) await ssgCloseTab(ssgCheckTabId);
+        ssgCheckTabId = null;
         ssgBusy = false;
     }
 }
 
-async function ssgStart(tabId, id, pw) {
+async function ssgStart(id, pw) {
     await chrome.alarms.create(SSG_ALARM, { periodInMinutes: SSG_CHECK_MINUTES });
-    await ssgLog(`▶ SSG 자동 재로그인 시작 (탭 ${tabId}, ${SSG_CHECK_MINUTES}분마다 확인)`,
-        { running: true, tabId, id, pw, loggedIn: null });
+    await ssgLog(`▶ SSG 자동 재로그인 시작 (${SSG_CHECK_MINUTES}분마다 새 탭으로 마이페이지 확인)`,
+        { running: true, id, pw, loggedIn: null });
     ssgCheck('시작 직후'); // 기다리지 않고 바로 첫 확인
 }
 
 async function ssgStop(why = '⏹ SSG 자동 재로그인 중지') {
     await chrome.alarms.clear(SSG_ALARM);
-    await ssgLog(why, { running: false, tabId: null });
+    await ssgCloseTab(ssgCheckTabId);   // 확인 중이던 탭이 있으면 같이 닫음
+    ssgCheckTabId = null;
+    await ssgLog(why, { running: false });
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -315,21 +321,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || typeof msg.type !== 'string' || !msg.type.startsWith('ssg_')) return;
     (async () => {
-        if (msg.type === 'ssg_start') await ssgStart(msg.tabId, msg.id, msg.pw);
+        if (msg.type === 'ssg_start') await ssgStart(msg.id, msg.pw);
         else if (msg.type === 'ssg_stop') await ssgStop();
         sendResponse(await ssgGetState());
     })();
     return true; // 비동기 응답
 });
 
-// 로그인용 탭이 닫히면 자동으로 중지
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-    const st = await ssgGetState();
-    if (st.running && st.tabId === tabId) await ssgStop('❌ SSG 로그인용 탭이 닫혀 자동 재로그인을 중지합니다.');
-});
-
-// 브라우저를 다시 켰을 때: 이전 탭은 사라졌으므로 실행 상태를 정리
+// 브라우저를 다시 켰을 때: 매번 새 탭을 열어 확인하므로 실행 상태를 그대로 이어간다
+// (chrome.alarms 는 브라우저 재시작 후에도 유지됨)
 chrome.runtime.onStartup.addListener(async () => {
     const st = await ssgGetState();
-    if (st.running) await ssgStop('ℹ️ 브라우저가 다시 시작되어 SSG 자동 재로그인이 꺼졌습니다. 다시 실행해주세요.');
+    if (st.running) {
+        await ssgLog('ℹ️ 브라우저가 다시 시작됨 → SSG 자동 재로그인 계속 실행');
+        ssgCheck('브라우저 재시작');
+    }
 });
