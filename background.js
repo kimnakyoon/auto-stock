@@ -217,13 +217,6 @@ function ssgWaitForLoad(tabId, timeout = 30000, checkNow = true) {
 // 탭의 현재 주소를 돌려준다 (탭이 닫혀 있으면 null)
 const ssgTabUrl = (tabId) => chrome.tabs.get(tabId).then(t => t.url || '').catch(() => null);
 
-// 탭을 조용히 닫는다 (이미 닫혀 있어도 오류 없이 넘어감)
-async function ssgCloseTabs(tabIds) {
-    const ids = [].concat(tabIds).filter(Boolean);
-    if (!ids.length) return;
-    try { await chrome.tabs.remove(ids); } catch (e) { /* 이미 닫힘 */ }
-}
-
 // 지금 열려 있는 SSG 탭 목록
 async function ssgListTabs() {
     try { return await chrome.tabs.query({ url: SSG_TAB_MATCH }); } catch (e) { return []; }
@@ -247,14 +240,13 @@ async function ssgGetTab(st) {
     const t = await chrome.tabs.create({ url: SSG_CHECK_URL, active: false });
     return { tabId: t.id, created: true };
 }
+
 // 💡 확인용 탭을 제외한 "SSG 로그인 화면" 탭만 닫는다 (다른 SSG 탭은 그대로 둠)
 async function ssgCloseLoginTabs(keepTabId) {
-    const tabs = await ssgListTabs();
-    const extra = tabs.filter(t => t.id !== keepTabId && isSsgLoginUrl(t.url)).map(t => t.id);
-    if (!extra.length) return 0;
-    await ssgCloseTabs(extra);
+    const extra = (await ssgListTabs()).filter(t => t.id !== keepTabId && isSsgLoginUrl(t.url)).map(t => t.id);
+    if (!extra.length) return;
+    try { await chrome.tabs.remove(extra); } catch (e) { /* 이미 닫힘 */ }
     await ssgLog(`🧹 SSG 로그인 화면 탭이 따로 열려 있어 ${extra.length}개를 닫음 (확인용 탭은 그대로 둠)`);
-    return extra.length;
 }
 
 // SSG 로그인 화면에 아이디/비밀번호를 넣고 로그인 버튼을 누른다 (페이지 안에서 실행)
@@ -295,16 +287,12 @@ async function ssgCheck(reason) {
 
         // 1) 확인용 탭 확보 (처음 열어 둔 탭 재사용, 없을 때만 새로 연다)
         const { tabId, created } = await ssgGetTab(st);
-        if (tabId !== st.tabId) await chrome.storage.local.set({ ssgAuto: { ...(await ssgGetState()), tabId } });
-        await ssgLog(`🔍 로그인 상태 확인 시작 (${reason}) → ${created ? '새 SSG 탭을 열어' : '열어 둔 SSG 탭에서'} 마이페이지 이동`);
+        // 탭 번호 저장은 기록 한 줄과 함께 storage 쓰기 1회로 처리
+        await ssgLog(`🔍 로그인 상태 확인 시작 (${reason}) → ${created ? '새 SSG 탭을 열어' : '열어 둔 SSG 탭에서'} 마이페이지 이동`, { tabId });
 
         // 2) 그 탭에서 마이페이지로 이동 (새 탭이면 이미 그 주소로 열렸으므로 로딩만 기다린다)
-        if (created) {
-            await ssgWaitForLoad(tabId, 30000, true);
-        } else {
-            await chrome.tabs.update(tabId, { url: SSG_CHECK_URL });
-            await ssgWaitForLoad(tabId, 30000, false);
-        }
+        if (!created) await chrome.tabs.update(tabId, { url: SSG_CHECK_URL });
+        await ssgWaitForLoad(tabId, 30000, created);
         await ssgWait(2000); // 자바스크립트 리다이렉트가 자리잡을 시간
 
         // 3) 확인용 탭 말고 SSG 로그인 화면 탭이 더 열려 있으면 그 탭들만 닫는다
