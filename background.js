@@ -168,7 +168,7 @@ chrome.windows.onRemoved.addListener(async (winId) => {
 //    1시간마다 "그 탭"에서 마이페이지로 이동해 로그인 상태를 확인하고,
 //    로그인 화면으로 넘어가면 같은 탭에서 저장된 아이디/비밀번호로 자동 로그인한다.
 //    확인이 끝나도 탭은 닫지 않는다. (실패해도 사용자가 직접 처리할 수 있도록 그대로 둠)
-//    SSG 탭이 여러 개 열려 있으면 확인용 탭 1개만 남기고 나머지는 닫는다.
+//    SSG 로그인 화면 탭이 따로 더 열려 있으면(확인용 탭 제외) 그 탭들만 닫는다. 다른 SSG 탭은 건드리지 않는다.
 //    chrome.alarms + 백그라운드에서 돌기 때문에 다른 창이 선택되어 있어도
 //    동작하고, 창을 앞으로 가져오지 않는다.
 // ═══════════════════════════════════════════════════════════════
@@ -247,14 +247,13 @@ async function ssgGetTab(st) {
     const t = await chrome.tabs.create({ url: SSG_CHECK_URL, active: false });
     return { tabId: t.id, created: true };
 }
-
-// 💡 확인용 탭 1개만 남기고 나머지 SSG 탭은 닫는다
-async function ssgCloseOtherTabs(keepTabId) {
+// 💡 확인용 탭을 제외한 "SSG 로그인 화면" 탭만 닫는다 (다른 SSG 탭은 그대로 둠)
+async function ssgCloseLoginTabs(keepTabId) {
     const tabs = await ssgListTabs();
-    const extra = tabs.filter(t => t.id !== keepTabId).map(t => t.id);
+    const extra = tabs.filter(t => t.id !== keepTabId && isSsgLoginUrl(t.url)).map(t => t.id);
     if (!extra.length) return 0;
     await ssgCloseTabs(extra);
-    await ssgLog(`🧹 SSG 탭이 여러 개 열려 있어 확인용 탭 1개만 남기고 ${extra.length}개를 닫음`);
+    await ssgLog(`🧹 SSG 로그인 화면 탭이 따로 열려 있어 ${extra.length}개를 닫음 (확인용 탭은 그대로 둠)`);
     return extra.length;
 }
 
@@ -308,8 +307,8 @@ async function ssgCheck(reason) {
         }
         await ssgWait(2000); // 자바스크립트 리다이렉트가 자리잡을 시간
 
-        // 3) 다른 SSG 탭이 더 열려 있으면 확인용 탭만 남기고 닫는다
-        await ssgCloseOtherTabs(tabId);
+        // 3) 확인용 탭 말고 SSG 로그인 화면 탭이 더 열려 있으면 그 탭들만 닫는다
+        await ssgCloseLoginTabs(tabId);
 
         const url = await ssgTabUrl(tabId);
         if (url === null) { await ssgLog('⚠️ 확인용 탭이 도중에 닫혀 이번 확인을 건너뜁니다.'); return; }
