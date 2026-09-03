@@ -129,7 +129,7 @@ function renderSsgStatus(st) {
   const btn = document.getElementById('btnSsgStart');
   if (!st) { box.textContent = '상태: 꺼짐'; btn.textContent = 'SSG 로그인 실행'; return; }
   const head = st.running
-    ? '상태: 실행 중 (1시간마다 열어 둔 SSG 탭에서 마이페이지 확인)'
+    ? '상태: 실행 중 (로그인 화면으로 넘어가면 즉시 재로그인, 1시간마다 확인)'
     : '상태: 꺼짐';
   const lines = (st.log || []).slice(-3).join('\n');
   box.textContent = lines ? `${head}\n${lines}` : head;

@@ -165,7 +165,8 @@ chrome.windows.onRemoved.addListener(async (winId) => {
 // ═══════════════════════════════════════════════════════════════
 // 💡 SSG 자동 재로그인
 //    처음 실행할 때 SSG 탭을 하나 열어 두고(백그라운드), 그 탭을 닫지 않고 계속 둔다.
-//    1시간마다 "그 탭"에서 마이페이지로 이동해 로그인 상태를 확인하고,
+//    어떤 SSG 탭이든 로그인 화면으로 넘어가는 순간(= 로그아웃이 드러나는 순간) 바로 확인을 돌리고,
+//    안전장치로 1시간마다도 "그 탭"에서 마이페이지로 이동해 로그인 상태를 확인한다.
 //    로그인 화면으로 넘어가면 같은 탭에서 저장된 아이디/비밀번호로 자동 로그인한다.
 //    확인이 끝나도 탭은 닫지 않는다. (실패해도 사용자가 직접 처리할 수 있도록 그대로 둠)
 //    SSG 로그인 화면 탭이 따로 더 열려 있으면(확인용 탭 제외) 그 탭들만 닫는다. 다른 SSG 탭은 건드리지 않는다.
@@ -173,7 +174,8 @@ chrome.windows.onRemoved.addListener(async (winId) => {
 //    동작하고, 창을 앞으로 가져오지 않는다.
 // ═══════════════════════════════════════════════════════════════
 const SSG_ALARM = 'mango_ssg_check';
-const SSG_CHECK_MINUTES = 60;                       // 로그인 확인 주기 (1시간)
+const SSG_CHECK_MINUTES = 60;                       // 안전장치용 로그인 확인 주기 (1시간)
+const SSG_EVENT_COOLDOWN_MS = 60 * 1000;            // 로그인 화면 감지로 확인을 돌린 뒤 같은 이유로 다시 돌리지 않는 시간
 // 로그인이 풀려 있으면 member.ssg.com 로그인 화면으로 넘어가는 주소 (마이페이지 메인)
 const SSG_CHECK_URL = 'https://www.ssg.com/myssg/main.ssg';
 const SSG_TAB_MATCH = ['*://*.ssg.com/*'];          // SSG 탭으로 볼 주소 패턴
@@ -333,7 +335,7 @@ async function ssgCheck(reason) {
 
 async function ssgStart(id, pw) {
     await chrome.alarms.create(SSG_ALARM, { periodInMinutes: SSG_CHECK_MINUTES });
-    await ssgLog(`▶ SSG 자동 재로그인 시작 (SSG 탭 하나를 열어 두고 ${SSG_CHECK_MINUTES}분마다 그 탭에서 마이페이지 확인)`,
+    await ssgLog(`▶ SSG 자동 재로그인 시작 (로그인 화면으로 넘어가면 즉시 + ${SSG_CHECK_MINUTES}분마다 열어 둔 SSG 탭에서 확인)`,
         { running: true, id, pw, loggedIn: null });
     ssgCheck('시작 직후'); // 기다리지 않고 바로 첫 확인
 }
@@ -346,6 +348,16 @@ async function ssgStop(why = '⏹ SSG 자동 재로그인 중지 (열어 둔 SSG
 
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === SSG_ALARM) ssgCheck('1시간 주기');
+});
+
+// 💡 로그아웃 즉시 감지: 어떤 SSG 탭이든 주소가 로그인 화면으로 바뀌면 바로 확인을 돌린다.
+//    확인 중(ssgBusy)이면 확인용 탭이 로그인 화면으로 가는 것이므로 무시하고,
+//    감지로 한 번 돌린 뒤 SSG_EVENT_COOLDOWN_MS 안에는 다시 돌리지 않는다 (실패 반복 방지).
+let ssgEventLast = 0;
+chrome.tabs.onUpdated.addListener((_, info) => {
+    if (ssgBusy || !isSsgLoginUrl(info.url) || Date.now() - ssgEventLast < SSG_EVENT_COOLDOWN_MS) return;
+    ssgEventLast = Date.now();
+    ssgCheck('로그인 화면 감지');
 });
 
 // 팝업에서 오는 명령
