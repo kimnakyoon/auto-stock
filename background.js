@@ -165,9 +165,9 @@ chrome.windows.onRemoved.addListener(async (winId) => {
 // ═══════════════════════════════════════════════════════════════
 // 💡 SSG 자동 재로그인
 //    처음 실행할 때 SSG 탭을 하나 열어 두고(백그라운드), 그 탭을 닫지 않고 계속 둔다.
-//    어떤 SSG 탭이든 로그인 화면으로 넘어가는 순간(= 로그아웃이 드러나는 순간) 바로 확인을 돌리고,
+//    어떤 SSG 탭이든 로그인 화면으로 넘어가거나 화면 안에 "로그인" 표시가 보이는 순간(= 로그아웃이 드러나는 순간) 바로 확인을 돌리고,
 //    안전장치로 1시간마다도 "그 탭"에서 마이페이지로 이동해 로그인 상태를 확인한다.
-//    로그인 화면으로 넘어가면 같은 탭에서 저장된 아이디/비밀번호로 자동 로그인한다.
+//    로그아웃 상태면 (로그인 화면이 아니면 로그인 화면으로 이동한 뒤) 같은 탭에서 저장된 아이디/비밀번호로 자동 로그인한다.
 //    확인이 끝나도 탭은 닫지 않는다. (실패해도 사용자가 직접 처리할 수 있도록 그대로 둠)
 //    SSG 로그인 화면 탭이 따로 더 열려 있으면(확인용 탭 제외) 그 탭들만 닫는다. 다른 SSG 탭은 건드리지 않는다.
 //    chrome.alarms + 백그라운드에서 돌기 때문에 다른 창이 선택되어 있어도
@@ -181,9 +181,42 @@ const SSG_CHECK_URL = 'https://www.ssg.com/myssg/main.ssg';
 const SSG_TAB_MATCH = ['*://*.ssg.com/*'];          // SSG 탭으로 볼 주소 패턴
 const SSG_LOG_MAX = 30;
 
+// 화면에 "로그인" 표시만 있고 로그인 화면으로 안 넘어갈 때, 직접 이동할 로그인 화면 주소
+const SSG_LOGIN_URL = 'https://member.ssg.com/member/login.ssg';
+
 const isSsgLoginUrl = (url) => /login\.ssg|member\.ssg\.com/i.test(url || '');
 const isSsgUrl = (url) => /^https?:\/\/([^/]*\.)?ssg\.com\//i.test(url || '');
 const ssgWait = (ms) => new Promise(r => setTimeout(r, ms));
+
+// 💡 SSG 화면 안에 로그인/로그아웃 표시가 있는지 본다 (페이지 안에서 실행)
+//    로그아웃해도 주소가 로그인 화면으로 안 바뀌는 경우가 있어서, 주소와 함께 화면 내용으로도 판단한다.
+//    hasLogin  : 화면에 보이는 "로그인" 링크/버튼이 있음 (= 로그아웃 상태)
+//    hasLogout : 화면에 보이는 "로그아웃" 링크/버튼이 있음 (= 로그인 상태)
+//    hasPwInput: 비밀번호 입력칸이 있음 (= 로그인 화면)
+//    loginHref : "로그인" 링크의 주소 (있으면 그 주소로 이동해서 로그인)
+function ssgPageState() {
+    const vis = (el) => el.offsetParent !== null;
+    const txt = (el) => ((el.innerText || el.textContent || el.value || el.getAttribute('title') || '') + '').replace(/\s+/g, '');
+    const els = [...document.querySelectorAll('a, button, input[type="submit"], input[type="button"]')].filter(vis);
+    const hasLogout = els.some(el => txt(el).includes('로그아웃'));
+    const loginEls = els.filter(el => txt(el).includes('로그인') && !txt(el).includes('로그아웃'));
+    const link = loginEls.find(el => el.tagName === 'A' && /^https?:/i.test(el.href || ''));
+    return {
+        hasLogin: loginEls.length > 0,
+        hasLogout,
+        hasPwInput: !!document.querySelector('input[type="password"]'),
+        loginHref: link ? link.href : '',
+    };
+}
+// 탭에서 ssgPageState 를 실행한다 (실행 못 하면 null)
+async function ssgProbe(tabId) {
+    try {
+        const [r] = await chrome.scripting.executeScript({ target: { tabId }, func: ssgPageState });
+        return (r && r.result) || null;
+    } catch (e) { return null; }
+}
+// 화면 내용으로 본 로그아웃 여부: 로그인 화면이거나, "로그인" 표시는 있는데 "로그아웃" 표시는 없으면 로그아웃 상태
+const ssgLoggedOut = (p) => !!p && (p.hasPwInput || (p.hasLogin && !p.hasLogout));
 
 async function ssgGetState() {
     const r = await chrome.storage.local.get('ssgAuto');
@@ -214,6 +247,12 @@ function ssgWaitForLoad(tabId, timeout = 30000, checkNow = true) {
         setTimeout(finish, timeout);
         if (checkNow) chrome.tabs.get(tabId).then(t => { if (t.status === 'complete') finish(); }).catch(finish);
     });
+}
+
+// 로딩이 끝나고 자바스크립트 리다이렉트가 자리잡을 때까지 기다린다
+async function ssgSettle(tabId, checkNow) {
+    await ssgWaitForLoad(tabId, 30000, checkNow);
+    await ssgWait(2000);
 }
 
 // 탭의 현재 주소를 돌려준다 (탭이 닫혀 있으면 null)
@@ -294,18 +333,28 @@ async function ssgCheck(reason) {
 
         // 2) 그 탭에서 마이페이지로 이동 (새 탭이면 이미 그 주소로 열렸으므로 로딩만 기다린다)
         if (!created) await chrome.tabs.update(tabId, { url: SSG_CHECK_URL });
-        await ssgWaitForLoad(tabId, 30000, created);
-        await ssgWait(2000); // 자바스크립트 리다이렉트가 자리잡을 시간
+        await ssgSettle(tabId, created);
 
         // 3) 확인용 탭 말고 SSG 로그인 화면 탭이 더 열려 있으면 그 탭들만 닫는다
         await ssgCloseLoginTabs(tabId);
 
+        // 4) 주소가 로그인 화면이거나, 화면 안에 "로그인" 표시가 있으면(로그아웃 표시는 없음) 로그아웃 상태로 본다
         const url = await ssgTabUrl(tabId);
         if (url === null) { await ssgLog('⚠️ 확인용 탭이 도중에 닫혀 이번 확인을 건너뜁니다.'); return; }
-        if (!isSsgLoginUrl(url)) { await ok('SSG 로그인 유지 중'); return; }
+        const page = await ssgProbe(tabId);
+        const onLoginPage = isSsgLoginUrl(url) || !!(page && page.hasPwInput);
+        if (!onLoginPage && !ssgLoggedOut(page)) { await ok('SSG 로그인 유지 중'); return; }
 
-        await ssgLog('⚠️ 로그인이 풀려 있음 → 같은 탭에서 자동 로그인 시도');
+        await ssgLog(`⚠️ 로그인이 풀려 있음 (${onLoginPage ? '로그인 화면' : '화면에 로그인 표시'}) → 같은 탭에서 자동 로그인 시도`);
         if (!st.id || !st.pw) { await fail('아이디/비밀번호가 저장되어 있지 않아 로그인할 수 없습니다.'); return; }
+
+        // 5) 로그인 화면이 아니면(로그아웃해도 주소가 안 바뀐 경우) "로그인" 링크 주소로, 없으면 기본 로그인 주소로 이동
+        if (!onLoginPage) {
+            const go = (page && page.loginHref) || SSG_LOGIN_URL;
+            await ssgLog(`➡️ 로그인 화면으로 이동: ${go}`);
+            await chrome.tabs.update(tabId, { url: go });
+            await ssgSettle(tabId, false);
+        }
 
         // 로그인 화면이 아직 완전히 그려지지 않았을 수 있어 입력칸이 나타날 때까지 잠시 대기 (최대 5회)
         let res = null;
@@ -318,12 +367,15 @@ async function ssgCheck(reason) {
         }
         if (!res || !res.ok) { await fail(`자동 로그인 실패: ${(res && res.reason) || '스크립트 실행 오류'}`); return; }
 
-        // 로그인 처리 대기 (최대 30초): 로그인 화면에서 벗어나면 성공
+        // 로그인 처리 대기 (최대 30초): 로그인 화면에서 벗어나고 화면에 로그인 표시도 없으면 성공
         for (let i = 0; i < 20; i++) {
             await ssgWait(1500);
             const u = await ssgTabUrl(tabId);
             if (u === null) break;
-            if (!isSsgLoginUrl(u)) { await ok('SSG 자동 로그인 성공'); return; }
+            if (isSsgLoginUrl(u)) continue;
+            await ssgWait(1500); // 이동한 화면이 그려질 시간
+            if (ssgLoggedOut(await ssgProbe(tabId))) { await fail('로그인 화면에서는 벗어났지만 화면에 아직 로그인 표시가 있음 (비밀번호 확인 필요)'); return; }
+            await ok('SSG 자동 로그인 성공'); return;
         }
         await fail('로그인 버튼을 눌렀지만 로그인 화면에서 벗어나지 못함 (비밀번호/보안문자 확인 필요)');
     } catch (e) {
@@ -335,7 +387,7 @@ async function ssgCheck(reason) {
 
 async function ssgStart(id, pw) {
     await chrome.alarms.create(SSG_ALARM, { periodInMinutes: SSG_CHECK_MINUTES });
-    await ssgLog(`▶ SSG 자동 재로그인 시작 (로그인 화면으로 넘어가면 즉시 + ${SSG_CHECK_MINUTES}분마다 열어 둔 SSG 탭에서 확인)`,
+    await ssgLog(`▶ SSG 자동 재로그인 시작 (로그인 화면/로그인 표시가 보이면 즉시 + ${SSG_CHECK_MINUTES}분마다 열어 둔 SSG 탭에서 확인)`,
         { running: true, id, pw, loggedIn: null });
     ssgCheck('시작 직후'); // 기다리지 않고 바로 첫 확인
 }
@@ -350,14 +402,25 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === SSG_ALARM) ssgCheck('1시간 주기');
 });
 
-// 💡 로그아웃 즉시 감지: 어떤 SSG 탭이든 주소가 로그인 화면으로 바뀌면 바로 확인을 돌린다.
-//    확인 중(ssgBusy)이면 확인용 탭이 로그인 화면으로 가는 것이므로 무시하고,
+// 💡 로그아웃 즉시 감지: 어떤 SSG 탭이든
+//    (1) 주소가 로그인 화면으로 바뀌거나
+//    (2) 로딩이 끝난 화면 안에 "로그인" 표시가 있으면(로그아웃해도 주소가 안 바뀌는 경우) 바로 확인을 돌린다.
+//    확인 중(ssgBusy)이면 확인용 탭이 움직이는 것이므로 무시하고,
 //    감지로 한 번 돌린 뒤 SSG_EVENT_COOLDOWN_MS 안에는 다시 돌리지 않는다 (실패 반복 방지).
 let ssgEventLast = 0;
-chrome.tabs.onUpdated.addListener((_, info) => {
-    if (ssgBusy || !isSsgLoginUrl(info.url) || Date.now() - ssgEventLast < SSG_EVENT_COOLDOWN_MS) return;
+function ssgTrigger(reason) {
+    if (ssgBusy || Date.now() - ssgEventLast < SSG_EVENT_COOLDOWN_MS) return;
     ssgEventLast = Date.now();
-    ssgCheck('로그인 화면 감지');
+    ssgCheck(reason);
+}
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+    if (ssgBusy) return;
+    if (isSsgLoginUrl(info.url)) { ssgTrigger('로그인 화면 감지'); return; }
+    if (info.status !== 'complete' || !isSsgUrl(tab && tab.url)) return;
+    if (!(await ssgGetState()).running) return;
+    await ssgWait(1500); // 상단 메뉴가 그려질 시간
+    if (ssgBusy) return;
+    if (ssgLoggedOut(await ssgProbe(tabId))) ssgTrigger('화면에 로그인 표시 감지');
 });
 
 // 팝업에서 오는 명령
