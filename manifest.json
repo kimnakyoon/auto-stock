@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "더망고 자동화 매크로",
+  "version": "13.4",
+  "description": "로딩 지연 에러 자동 재시도, 팝업 창 위치 강제 고정, 창 순차 오픈",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["activeTab", "scripting", "storage", "system.display", "alarms"],
+  "host_permissions": ["*://*.mycafe24.com/*"]
+}

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { width: 260px; padding: 15px; font-family: 'Malgun Gothic', sans-serif; margin: 0; }
+    h3 { margin-top: 0; color: #333; font-size: 15px; text-align: center; }
+    .row { margin-bottom: 10px; font-size: 12px; font-weight: bold; color: #444; }
+    .row input, .row select { width: 100%; box-sizing: border-box; padding: 6px; margin-top: 4px; border: 1px solid #ccc; border-radius: 4px; font-family: inherit; }
+    .coord-group { display: flex; gap: 10px; margin-top: 5px; }
+    .coord-group div { flex: 1; font-size: 11px; font-weight: normal; }
+    button { width: 100%; padding: 12px 0; color: white; background: #2980b9; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 13px; margin-top: 10px; }
+    button:hover { background: #1f6391; }
+  </style>
+</head>
+<body>
+  <h3>🥭 더망고 자동화 상세설정</h3>
+  
+  <div class="row">
+    시작/끝 번호 
+    <div class="coord-group">
+      <div>시작 <input type="number" id="startLimit" value="1"></div>
+      <div>끝(빈칸=전체) <input type="number" id="endLimit" placeholder="예:3000"></div>
+    </div>
+  </div>
+  
+  <div class="row">
+    작업 분할 방식
+    <select id="divideMode">
+      <option value="custom">직접 개수 입력</option>
+      <option value="2">전체 1/2씩 (창 2개로 분할)</option>
+      <option value="3">전체 1/3씩 (창 3개로 분할)</option>
+      <option value="4">전체 1/4씩 (창 4개로 분할)</option>
+      <option value="5">전체 1/5씩 (창 5개로 분할)</option>
+      <option value="6">전체 1/6씩 (창 6개로 분할)</option>
+      <option value="7">전체 1/7씩 (창 7개로 분할)</option>
+      <option value="8">전체 1/8씩 (창 8개로 분할)</option>
+      <option value="9">전체 1/9씩 (창 9개로 분할)</option>
+      <option value="10">전체 1/10씩 (창 10개로 분할)</option>
+      <option value="13">전체 1/13씩 (창 13개로 분할)</option>
+    </select>
+  </div>
+  
+  <div class="row" id="customBatchRow">
+    한 창당 처리 개수
+    <input type="number" id="batchSize" value="800">
+  </div>
+
+  <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;">
+
+  <div class="row">
+    창 띄울 위치 선택 (실행한 모니터 기준)
+    <select id="posPreset">
+      <option value="450">위치 0 (가로: 450)</option>
+      <option value="700">위치 1 (가로: 700)</option>
+      <option value="950">위치 2 (가로: 950)</option>
+      <option value="1200">위치 3 (가로: 1200)</option>
+      <option value="1450">위치 4 (가로: 1450)</option>
+      <option value="1700" selected>위치 5 (가로: 1700)</option>
+    </select>
+  </div>
+
+  <button id="btnRun">▶ 자동화 실행</button>
+  
+  <script src="popup.js"></script>
+</body>
+</html>
