@@ -176,7 +176,7 @@ chrome.windows.onRemoved.addListener(async (winId) => {
 //    [작업 창 CAPTCHA 정리] 로그인이 풀린 채 작업하면 더망고 작업 창에 "로그인 페이지 또는 CAPTCHA 페이지입니다"
 //    알림이 뜨며 멈춘다. 실행 탭이 그 신호(mango_ssg_captcha)를 보내오면 로그인 확인/재로그인을 한 뒤,
 //    로그인이 되어 있을 때만 (1) 알림이 뜬 작업 창(mycafe24)과 (2) 작업 창이 배열에 맞춰 띄운 SSG 팝업창을 모두 닫는다.
-//    실행 탭은 창이 닫힌 것을 보고 같은 구간을 새 창으로 다시 실행한다.
+//    실행 탭은 닫힌 창을 끝난 것으로 보고, 모든 창이 끝나면 다음 사이클을 처음부터 다시 시작한다.
 // ═══════════════════════════════════════════════════════════════
 const SSG_ALARM = 'mango_ssg_check';
 const SSG_CHECK_MINUTES = 60;                       // 안전장치용 로그인 확인 주기 (1시간)
@@ -423,7 +423,7 @@ async function ssgCloseCaptchaWindows(captchaTabs) {
     if (captchaTabs.length) {
         try { await chrome.tabs.remove(captchaTabs); } catch (e) { /* 이미 닫힘 */ }
     }
-    await ssgLog(`🧹 CAPTCHA 작업 창 ${captchaTabs.length}개, 배열 SSG 팝업창 ${popups}개를 닫음 → 실행 탭이 해당 구간을 다시 실행`);
+    await ssgLog(`🧹 CAPTCHA 작업 창 ${captchaTabs.length}개, 배열 SSG 팝업창 ${popups}개를 닫음 → 실행 탭은 모든 창이 끝나면 다음 사이클을 처음부터 시작`);
 }
 
 // 실행 탭은 창이 안 닫히면 1분마다 다시 신호를 보내므로, 처리 중이면 무시하고 꺼짐 경고도 자주 남기지 않는다
