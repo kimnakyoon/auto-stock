@@ -147,8 +147,7 @@ function mangoAutoLoop(CFG) {
 
             // 💡 SSG 로그인이 풀리면 더망고가 "로그인 페이지 또는 CAPTCHA 페이지입니다" alert 를 띄우며 이 창이 막힌다.
             //    대화상자는 띄우지 않고 표식(__MANGO_CAPTCHA)만 남긴다 → 실행 탭이 이 표식을 보고
-            //    확장에 SSG 재로그인을 요청하고, 확장이 이 창을 닫으면 이 창은 끝난 것으로 보고
-            //    모든 창이 끝난 뒤 다음 사이클을 처음부터(수량 파악 → 창 순차 오픈) 다시 시작한다.
+            //    확장에 SSG 재로그인을 요청한다. 이후 처리는 실행 탭의 감시 루프가 정한다.
             const nativeAlert = window.alert.bind(window);
             window.alert = function(msg) {
                 const s = String(msg ?? '');
@@ -330,18 +329,25 @@ function mangoAutoLoop(CFG) {
     const focusRunner = () => signalExt('MANGO_FOCUS_RUNNER');
     const CAPTCHA_NOTIFY_MS = 60000; // 확장이 아직 안 닫아 줬으면 이 간격으로 다시 알린다
 
+    // 💡 작업 창 하나를 끝난 것으로 표시한다 (사이클은 모든 창이 끝나면 다음 바퀴를 처음부터 시작)
+    function finishWorker(t, msg) {
+        t.done = true;
+        t.onReady = null;
+        if (msg) log(msg);
+    }
+
     // 💡 작업 창을 닫고 같은 구간으로 새 창을 열어 처음부터 다시 실행한다 ("전송을 종료합니다" 조기 종료용)
     function reopenWorker(t) {
         try { t.win.close(); } catch (e) {}
         const nw = window.open(MAIN_URL, '_blank');
         if (!nw) {
-            t.done = true;
-            log(`⚠️ [${t.start}~${t.end}] 재실행 창을 열지 못했습니다. (팝업 차단 확인)`);
+            finishWorker(t, `⚠️ [${t.start}~${t.end}] 재실행 창을 열지 못했습니다. (팝업 차단 확인)`);
             return;
         }
         nw.opener = null;
         t.win = nw;
         t.ready = false;
+        t.captchaAt = 0;
         startWorkerSetup(t);
         focusRunner(); // 재실행 창이 앞으로 나오므로 실행 탭으로 되돌아온다
     }
@@ -384,13 +390,12 @@ function mangoAutoLoop(CFG) {
             const end = Math.min(start + batchSize - 1, endLimit);
 
             const w = window.open(MAIN_URL, '_blank');
-            // captchaAt: SSG 로그인/CAPTCHA 알림을 감지한 시각 (0 이면 감지 안 됨), 확장에 마지막으로 알린 시각으로도 쓴다
+            // captchaAt: SSG 로그인/CAPTCHA 알림을 감지한 시각 (0 이면 감지 안 됨)
             const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, lastRetry: 0, retryCount: 0, abortCount: 0, captchaAt: 0 };
             workers.push(t);
 
             if (!w) { // 창 자체가 안 열리면(팝업 차단 등) 이 구간은 건너뛰어 사이클이 영원히 멈추지 않게 함
-                t.done = true;
-                log(`⚠️ ${i + 1}/${totalTabs}번째 창 [${start}~${end}]을 열지 못했습니다. (팝업 차단 확인)`);
+                finishWorker(t, `⚠️ ${i + 1}/${totalTabs}번째 창 [${start}~${end}]을 열지 못했습니다. (팝업 차단 확인)`);
                 continue;
             }
             w.opener = null;
@@ -413,17 +418,31 @@ function mangoAutoLoop(CFG) {
             focusRunner();
         }
 
+        // 💡 [정책] CAPTCHA 로 닫힌 창은 구간을 다시 열지 않는다. 닫힌 창은 모두 끝난 창으로 보고,
+        //    모든 창이 끝나면 다음 사이클을 처음부터(수량 파악 → 창 순차 오픈) 시작한다.
+        //    확장에는 사이클당 하나의 시계로 1분에 한 번만 알린다 (작업 창마다 따로 보내면 같은 요청이 창 수만큼 간다)
+        let captchaNotifiedAt = 0;
+        let reopenedAt = 0; // 재실행 창은 처음 열 때처럼 한 번(10초 틱)에 하나씩만 연다 (한꺼번에 열면 로딩 지연 유발)
         const monitorIt = bgTimer.setInterval(() => {
+            const now = Date.now();
             let allFinished = true;
-            let reopened = false; // 💡 처음 열 때처럼 재실행 창도 한 번(10초)에 하나씩만 연다 (한꺼번에 열면 로딩 지연 유발)
             for (const t of workers) {
                 if (t.done) continue;
                 try {
                     if (t.win.closed) {
-                        // 💡 CAPTCHA 감지 후 닫힌 창(확장이 SSG 재로그인 뒤 닫음, 또는 사용자가 닫음)
-                        //    → 구간을 다시 열지 않고 끝난 창으로 본다. 모든 창이 끝나면 아래에서 다음 사이클이 처음부터 시작된다.
-                        if (t.captchaAt) log(`🔁 [${t.start}~${t.end}] CAPTCHA 창이 닫힘 → 이 구간은 다시 열지 않고, 모든 창이 끝나면 다음 사이클을 처음부터 시작`);
-                        t.done = true;
+                        finishWorker(t, t.captchaAt && `🔁 [${t.start}~${t.end}] CAPTCHA 창이 닫힘 → 이 구간은 다시 열지 않음 (모든 창이 끝나면 다음 사이클 시작)`);
+                        continue;
+                    }
+
+                    // 💡 SSG 로그인/CAPTCHA 알림 표식(훅이 alert 를 가로채며 남김) 감지 — 값 하나만 읽으므로 비싼 검사들보다 먼저 본다
+                    //    → 확장에 알리고, 확장이 SSG 재로그인 뒤 이 창을 닫아 줄 때까지 기다린다 (닫히면 위에서 끝난 창으로 처리)
+                    if (!t.setupIt && t.win.__MANGO_CAPTCHA) {
+                        allFinished = false;
+                        if (!t.captchaAt) {
+                            t.captchaAt = now;
+                            log(`⚠️ [${t.start}~${t.end}] SSG 로그인/CAPTCHA 감지 → 확장에 SSG 재로그인 요청 (로그인 후 이 창을 닫음)`);
+                        }
+                        if (now - captchaNotifiedAt > CAPTCHA_NOTIFY_MS) { captchaNotifiedAt = now; signalExt('MANGO_SSG_CAPTCHA'); }
                         continue;
                     }
 
@@ -441,33 +460,24 @@ function mangoAutoLoop(CFG) {
                         continue;
                     }
 
-                    // 💡 SSG 로그인/CAPTCHA 알림 표식(훅이 alert 를 가로채며 남김) 감지
-                    //    → 확장에 알리고, 확장이 SSG 재로그인 뒤 이 창을 닫아 줄 때까지 기다린다 (닫히면 위에서 끝난 창으로 처리)
-                    if (!t.setupIt && t.win.__MANGO_CAPTCHA) {
-                        allFinished = false;
-                        if (!t.captchaAt) log(`⚠️ [${t.start}~${t.end}] SSG 로그인/CAPTCHA 감지 → 확장에 SSG 재로그인 요청 (로그인 후 이 창을 닫음)`);
-                        if (Date.now() - t.captchaAt > CAPTCHA_NOTIFY_MS) { t.captchaAt = Date.now(); signalExt('MANGO_SSG_CAPTCHA'); }
-                        continue;
-                    }
-
                     // 진행 메시지 영역(layer_page)을 한 번만 읽어 "전송 종료"와 "완료"를 함께 판정
                     const layer = (t.win.document.getElementById('layer_page')?.innerText || '').replace(/\s+/g, '');
 
                     // 💡 "전송을 종료합니다" 조기 종료 → 해당 창만 닫고 같은 구간으로 새 창을 열어 다시 실행
                     if (!t.setupIt && layer.includes(normalizedAbort)) {
                         allFinished = false;
-                        if (reopened) continue;
-                        reopened = true;
-                        t.abortCount++;
-                        log(`⚠️ [${t.start}~${t.end}] 전송 종료 문구 감지 → 창 닫고 재실행 ${t.abortCount}회차`);
-                        reopenWorker(t);
+                        if (reopenedAt !== now) {
+                            reopenedAt = now;
+                            log(`⚠️ [${t.start}~${t.end}] 전송 종료 문구 감지 → 창 닫고 재실행 ${++t.abortCount}회차`);
+                            reopenWorker(t);
+                        }
                         continue;
                     }
 
                     if (layer.includes(normalizedSuccess)) {
-                        t.done = true;
-                        log(`✅ [${t.start}~${t.end}] 완료. (3초 후 탭 자동 종료)`);
-                        bgTimer.setTimeout(() => { try { t.win.close(); } catch (e) {} }, 3000);
+                        finishWorker(t, `✅ [${t.start}~${t.end}] 완료. (3초 후 탭 자동 종료)`);
+                        const w = t.win;
+                        bgTimer.setTimeout(() => { try { w.close(); } catch (e) {} }, 3000);
                     } else {
                         allFinished = false;
                     }
