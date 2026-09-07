@@ -133,7 +133,6 @@ function mangoAutoLoop(CFG) {
     function brokenState(win) {
         try {
             const doc = win.document;
-            if (!doc) return 'blocked';
             // 관리자 페이지 요소가 있으면 정상 (값 하나만 보는 빠른 경로 — 본문 글자를 매번 읽지 않도록)
             if (typeof win.set_limit_num === 'function' || doc.getElementById('layer_page')) return null;
             const body = doc.body;
@@ -149,11 +148,6 @@ function mangoAutoLoop(CFG) {
     const BROKEN_CLOSE_MS = 30000;
     // 창을 연 뒤 이 시간이 지나도록 세팅(검색 → 범위 입력 → 작업 시작)이 안 끝나면 창을 닫고 다시 연다 (로딩이 영영 안 끝나는 경우)
     const SETUP_TIMEOUT_MS = 180000;
-    // 재실행 창은 처음 열 때처럼 한 번에 하나씩, 이 간격을 두고 연다 (여러 창을 한꺼번에 열면 다시 로딩 지연을 부름)
-    const REOPEN_GAP_MS = 10000;
-    let lastReopenAt = 0;
-    const canReopen = (now) => now - lastReopenAt >= REOPEN_GAP_MS;
-
     // 작업 창이 깨진 상태인지 보고, 오래 이어지면 창을 닫고 다시 연다. 돌려주는 값: 깨진 상태면 true
     function handleBroken(t, now) {
         const state = brokenState(t.win);
@@ -162,10 +156,7 @@ function mangoAutoLoop(CFG) {
             t.brokenAt = now;
             log(`⚠️ [${t.start}~${t.end}] ${BROKEN_NAMES[state]} 감지 → ${BROKEN_CLOSE_MS / 1000}초 안에 안 돌아오면 창을 닫고 다시 엽니다.`);
         }
-        if (now - t.brokenAt >= BROKEN_CLOSE_MS && canReopen(now)) {
-            log(`⚠️ [${t.start}~${t.end}] ${BROKEN_NAMES[state]}가 ${Math.round((now - t.brokenAt) / 1000)}초째 이어짐 → 창 닫고 재실행 ${++t.retryCount}회차`);
-            reopenWorker(t);
-        }
+        if (now - t.brokenAt >= BROKEN_CLOSE_MS) reopenWorker(t, `${BROKEN_NAMES[state]}가 ${Math.round((now - t.brokenAt) / 1000)}초째 이어짐`);
         return true;
     }
 
@@ -272,11 +263,7 @@ function mangoAutoLoop(CFG) {
                 if (handleBroken(t, now)) return;
 
                 // 로딩이 영영 안 끝나 세팅이 제한 시간을 넘기면 창을 닫고 다시 연다
-                if (now - t.openedAt > SETUP_TIMEOUT_MS && canReopen(now)) {
-                    log(`⚠️ [${t.start}~${t.end}] ${SETUP_TIMEOUT_MS / 60000}분이 지나도록 세팅이 안 끝남 → 창 닫고 재실행 ${++t.retryCount}회차`);
-                    reopenWorker(t);
-                    return;
-                }
+                if (now - t.openedAt > SETUP_TIMEOUT_MS) { reopenWorker(t, `${SETUP_TIMEOUT_MS / 60000}분이 지나도록 세팅이 안 끝남`); return; }
 
                 const doc = w.document;
                 if (doc.readyState !== 'complete' || w.location.href === 'about:blank') return;
@@ -375,10 +362,17 @@ function mangoAutoLoop(CFG) {
         if (msg) log(msg);
     }
 
-    // 💡 작업 창을 닫고 같은 구간으로 새 창을 열어 처음부터 다시 실행한다
+    // 💡 작업 창을 닫고 같은 구간으로 새 창을 열어 처음부터 다시 실행한다 (why: 기록에 남길 이유)
     //    ("전송을 종료합니다" 조기 종료, 지연 페이지가 이어질 때, 세팅이 제한 시간을 넘길 때)
-    function reopenWorker(t) {
-        lastReopenAt = Date.now();
+    //    재실행 창은 처음 열 때처럼 한 번에 하나씩, REOPEN_GAP_MS 간격을 두고 연다 (한꺼번에 열면 다시 로딩 지연을 부름)
+    //    간격이 안 지났으면 이번엔 열지 않는다 → 호출한 쪽 감시 루프가 다음 틱에 다시 시도한다
+    const REOPEN_GAP_MS = 10000;
+    let lastReopenAt = 0;
+    function reopenWorker(t, why) {
+        const now = Date.now();
+        if (now - lastReopenAt < REOPEN_GAP_MS) return;
+        lastReopenAt = now;
+        log(`⚠️ [${t.start}~${t.end}] ${why} → 창 닫고 재실행 ${++t.reopenCount}회차`);
         try { t.win.close(); } catch (e) {}
         const nw = window.open(MAIN_URL, '_blank');
         if (!nw) {
@@ -432,8 +426,8 @@ function mangoAutoLoop(CFG) {
 
             const w = window.open(MAIN_URL, '_blank');
             // captchaAt: SSG 로그인/CAPTCHA 알림을 감지한 시각, brokenAt: 지연 페이지 등 깨진 상태를 처음 본 시각 (0 이면 감지 안 됨)
-            // openedAt: 창을 연(다시 연) 시각 — 세팅 제한 시간 계산용, retryCount: 깨진 상태/세팅 지연으로 창을 다시 연 횟수
-            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, openedAt: 0, brokenAt: 0, retryCount: 0, abortCount: 0, captchaAt: 0 };
+            // openedAt: 창을 연(다시 연) 시각 — 세팅 제한 시간 계산용 (둘 다 startWorkerSetup 이 정함), reopenCount: 창을 닫고 다시 연 횟수
+            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, reopenCount: 0, captchaAt: 0 };
             workers.push(t);
 
             if (!w) { // 창 자체가 안 열리면(팝업 차단 등) 이 구간은 건너뛰어 사이클이 영원히 멈추지 않게 함
@@ -495,13 +489,10 @@ function mangoAutoLoop(CFG) {
                     // 진행 메시지 영역(layer_page)을 한 번만 읽어 "전송 종료"와 "완료"를 함께 판정
                     const layer = (t.win.document.getElementById('layer_page')?.innerText || '').replace(/\s+/g, '');
 
-                    // 💡 "전송을 종료합니다" 조기 종료 → 해당 창만 닫고 같은 구간으로 새 창을 열어 다시 실행 (재실행 간격은 canReopen)
+                    // 💡 "전송을 종료합니다" 조기 종료 → 해당 창만 닫고 같은 구간으로 새 창을 열어 다시 실행
                     if (!t.setupIt && layer.includes(normalizedAbort)) {
                         allFinished = false;
-                        if (canReopen(now)) {
-                            log(`⚠️ [${t.start}~${t.end}] 전송 종료 문구 감지 → 창 닫고 재실행 ${++t.abortCount}회차`);
-                            reopenWorker(t);
-                        }
+                        reopenWorker(t, '전송 종료 문구 감지');
                         continue;
                     }
 
