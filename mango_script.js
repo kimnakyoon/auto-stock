@@ -124,12 +124,49 @@ function mangoAutoLoop(CFG) {
     //    ("로그인 페이지 또는 CAPTCHA 페이지입니다. 로그인 또는 CAPTCHA 해제 후에 ... 다시 진행하시기 바랍니다.")
     const CAPTCHA_TEXT = 'CAPTCHA';
 
-    // 💡 카페24 서버 과부하 시 뜨는 "페이지 로딩이 잠시 지연되었습니다" 에러 페이지 감지
-    function isErrorPage(win) {
+    // 💡 작업 창이 "정상 관리자 페이지가 아닌 상태"인지 판정한다 (null 이면 정상 또는 아직 로딩 중)
+    //    'error'   : 카페24 과부하 시 뜨는 "페이지 로딩이 잠시 지연되었습니다" 문구가 보임
+    //    'foreign' : 로딩은 끝났는데 관리자 페이지 요소(set_limit_num 함수, layer_page)가 없음
+    //                → 문구가 글자가 아닌 그림으로 나오는 지연 페이지, 로그인 페이지 등 (문구 검사만으로는 못 잡던 경우)
+    //    'blocked' : 문서에 접근조차 안 됨 (크롬 자체 오류 페이지 등)
+    //    검색 버튼은 폼 전송으로 페이지를 통째로 다시 불러오므로, 그때 지연 페이지가 뜨면 여기서 잡힌다
+    function brokenState(win) {
         try {
-            const body = win.document.body;
-            return !!body && body.innerText.includes(ERROR_TEXT);
-        } catch (e) { return false; }
+            const doc = win.document;
+            if (!doc) return 'blocked';
+            // 관리자 페이지 요소가 있으면 정상 (값 하나만 보는 빠른 경로 — 본문 글자를 매번 읽지 않도록)
+            if (typeof win.set_limit_num === 'function' || doc.getElementById('layer_page')) return null;
+            const body = doc.body;
+            if (body && body.innerText.includes(ERROR_TEXT)) return 'error';
+            if (doc.readyState !== 'complete' || win.location.href === 'about:blank') return null;
+            return 'foreign';
+        } catch (e) { return 'blocked'; }
+    }
+    const BROKEN_NAMES = { error: '로딩 지연 페이지', foreign: '관리자 페이지가 아닌 화면', blocked: '접근 불가 페이지' };
+
+    // 💡 깨진 상태가 이 시간 이상 이어지면 그 창을 닫고 같은 구간으로 새 창을 열어 다시 실행한다
+    //    (같은 창에서 재접속하는 방식은 지연 페이지가 그대로 남아 멈추는 일이 있었음)
+    const BROKEN_CLOSE_MS = 30000;
+    // 창을 연 뒤 이 시간이 지나도록 세팅(검색 → 범위 입력 → 작업 시작)이 안 끝나면 창을 닫고 다시 연다 (로딩이 영영 안 끝나는 경우)
+    const SETUP_TIMEOUT_MS = 180000;
+    // 재실행 창은 처음 열 때처럼 한 번에 하나씩, 이 간격을 두고 연다 (여러 창을 한꺼번에 열면 다시 로딩 지연을 부름)
+    const REOPEN_GAP_MS = 10000;
+    let lastReopenAt = 0;
+    const canReopen = (now) => now - lastReopenAt >= REOPEN_GAP_MS;
+
+    // 작업 창이 깨진 상태인지 보고, 오래 이어지면 창을 닫고 다시 연다. 돌려주는 값: 깨진 상태면 true
+    function handleBroken(t, now) {
+        const state = brokenState(t.win);
+        if (!state) { t.brokenAt = 0; return false; }
+        if (!t.brokenAt) {
+            t.brokenAt = now;
+            log(`⚠️ [${t.start}~${t.end}] ${BROKEN_NAMES[state]} 감지 → ${BROKEN_CLOSE_MS / 1000}초 안에 안 돌아오면 창을 닫고 다시 엽니다.`);
+        }
+        if (now - t.brokenAt >= BROKEN_CLOSE_MS && canReopen(now)) {
+            log(`⚠️ [${t.start}~${t.end}] ${BROKEN_NAMES[state]}가 ${Math.round((now - t.brokenAt) / 1000)}초째 이어짐 → 창 닫고 재실행 ${++t.retryCount}회차`);
+            reopenWorker(t);
+        }
+        return true;
     }
 
     // 작업 탭 안에 팝업 위치 고정 + 로딩 지연 자동 재시도 훅을 심는다
@@ -216,26 +253,28 @@ function mangoAutoLoop(CFG) {
     }
 
     // 💡 작업 탭 세팅(검색 → 범위 입력 → 작업 시작)
-    //    에러 페이지가 뜨면 관리자 페이지로 재접속한 뒤 처음부터 다시 세팅한다
+    //    지연 페이지 등 깨진 상태가 이어지거나 세팅이 너무 오래 걸리면 창을 닫고 다시 열어 처음부터 세팅한다
     //    세팅이 끝나면(또는 창이 닫히면) t.onReady를 호출해 다음 창을 열도록 알린다
     function startWorkerSetup(t) {
         const wake = () => { const cb = t.onReady; t.onReady = null; if (cb) cb(); };
         const stop = () => { bgTimer.clearInterval(t.setupIt); t.setupIt = null; };
 
         stop();
+        t.brokenAt = 0;
+        t.openedAt = Date.now();
         t.setupIt = bgTimer.setInterval(() => {
             try {
                 const w = t.win;
                 if (!w || w.closed) { stop(); wake(); return; }
 
-                // 로딩 지연 에러 페이지 감지 → 15초 간격으로 재접속
-                if (isErrorPage(w)) {
-                    if (Date.now() - (t.lastRetry || 0) > 15000) {
-                        t.lastRetry = Date.now();
-                        t.retryCount = (t.retryCount || 0) + 1;
-                        log(`⚠️ [${t.start}~${t.end}] 로딩 지연 감지 → 재접속 ${t.retryCount}회차`);
-                        w.location.href = MAIN_URL;
-                    }
+                const now = Date.now();
+                // 지연 페이지 등 깨진 상태 → 30초 이상 이어지면 창을 닫고 다시 연다 (재실행 시 이 루프는 새로 시작됨)
+                if (handleBroken(t, now)) return;
+
+                // 로딩이 영영 안 끝나 세팅이 제한 시간을 넘기면 창을 닫고 다시 연다
+                if (now - t.openedAt > SETUP_TIMEOUT_MS && canReopen(now)) {
+                    log(`⚠️ [${t.start}~${t.end}] ${SETUP_TIMEOUT_MS / 60000}분이 지나도록 세팅이 안 끝남 → 창 닫고 재실행 ${++t.retryCount}회차`);
+                    reopenWorker(t);
                     return;
                 }
 
@@ -282,8 +321,8 @@ function mangoAutoLoop(CFG) {
                     // 💡 "검색된 상품이 없습니다" 같은 alert 창이 흐름을 막지 못하게 무력화
                     try { masterWorker.alert = function () {}; } catch (e) {}
 
-                    // 💡 수량 파악 탭도 로딩 지연 에러가 뜨면 재접속
-                    if (isErrorPage(masterWorker)) {
+                    // 💡 수량 파악 탭도 지연 페이지 등 깨진 상태면 재접속 (3분 넘게 실패하면 아래에서 탭을 닫고 사이클을 다시 시도)
+                    if (brokenState(masterWorker)) {
                         if (Date.now() - lastRetry > 15000) {
                             lastRetry = Date.now();
                             clicked = false;
@@ -336,8 +375,10 @@ function mangoAutoLoop(CFG) {
         if (msg) log(msg);
     }
 
-    // 💡 작업 창을 닫고 같은 구간으로 새 창을 열어 처음부터 다시 실행한다 ("전송을 종료합니다" 조기 종료용)
+    // 💡 작업 창을 닫고 같은 구간으로 새 창을 열어 처음부터 다시 실행한다
+    //    ("전송을 종료합니다" 조기 종료, 지연 페이지가 이어질 때, 세팅이 제한 시간을 넘길 때)
     function reopenWorker(t) {
+        lastReopenAt = Date.now();
         try { t.win.close(); } catch (e) {}
         const nw = window.open(MAIN_URL, '_blank');
         if (!nw) {
@@ -348,7 +389,7 @@ function mangoAutoLoop(CFG) {
         t.win = nw;
         t.ready = false;
         t.captchaAt = 0;
-        startWorkerSetup(t);
+        startWorkerSetup(t); // brokenAt/openedAt 도 여기서 초기화
         focusRunner(); // 재실행 창이 앞으로 나오므로 실행 탭으로 되돌아온다
     }
 
@@ -390,8 +431,9 @@ function mangoAutoLoop(CFG) {
             const end = Math.min(start + batchSize - 1, endLimit);
 
             const w = window.open(MAIN_URL, '_blank');
-            // captchaAt: SSG 로그인/CAPTCHA 알림을 감지한 시각 (0 이면 감지 안 됨)
-            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, lastRetry: 0, retryCount: 0, abortCount: 0, captchaAt: 0 };
+            // captchaAt: SSG 로그인/CAPTCHA 알림을 감지한 시각, brokenAt: 지연 페이지 등 깨진 상태를 처음 본 시각 (0 이면 감지 안 됨)
+            // openedAt: 창을 연(다시 연) 시각 — 세팅 제한 시간 계산용, retryCount: 깨진 상태/세팅 지연으로 창을 다시 연 횟수
+            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, openedAt: 0, brokenAt: 0, retryCount: 0, abortCount: 0, captchaAt: 0 };
             workers.push(t);
 
             if (!w) { // 창 자체가 안 열리면(팝업 차단 등) 이 구간은 건너뛰어 사이클이 영원히 멈추지 않게 함
@@ -422,7 +464,6 @@ function mangoAutoLoop(CFG) {
         //    모든 창이 끝나면 다음 사이클을 처음부터(수량 파악 → 창 순차 오픈) 시작한다.
         //    확장에는 사이클당 하나의 시계로 1분에 한 번만 알린다 (작업 창마다 따로 보내면 같은 요청이 창 수만큼 간다)
         let captchaNotifiedAt = 0;
-        let reopenedAt = 0; // 재실행 창은 처음 열 때처럼 한 번(10초 틱)에 하나씩만 연다 (한꺼번에 열면 로딩 지연 유발)
         const monitorIt = bgTimer.setInterval(() => {
             const now = Date.now();
             let allFinished = true;
@@ -434,7 +475,12 @@ function mangoAutoLoop(CFG) {
                         continue;
                     }
 
-                    // 💡 SSG 로그인/CAPTCHA 알림 표식(훅이 alert 를 가로채며 남김) 감지 — 값 하나만 읽으므로 비싼 검사들보다 먼저 본다
+                    // 💡 작업 시작 후 지연 페이지 등 깨진 상태가 되면 → 30초 이상 이어질 때 창을 닫고 같은 구간으로 새 창을 연다
+                    //    (세팅 중이면 startWorkerSetup 쪽에서 이미 처리하므로 setupIt이 없을 때만)
+                    //    문서에 접근이 안 되는 창은 아래 검사들이 모두 예외를 내므로 이 검사를 가장 먼저 한다
+                    if (!t.setupIt && handleBroken(t, now)) { allFinished = false; continue; }
+
+                    // 💡 SSG 로그인/CAPTCHA 알림 표식(훅이 alert 를 가로채며 남김) 감지
                     //    → 확장에 알리고, 확장이 SSG 재로그인 뒤 이 창을 닫아 줄 때까지 기다린다 (닫히면 위에서 끝난 창으로 처리)
                     if (!t.setupIt && t.win.__MANGO_CAPTCHA) {
                         allFinished = false;
@@ -446,28 +492,13 @@ function mangoAutoLoop(CFG) {
                         continue;
                     }
 
-                    // 💡 작업 시작 후 에러 페이지가 뜨면 → 재접속하고 해당 구간을 처음부터 재시작
-                    //    (세팅 중이면 startWorkerSetup 쪽에서 이미 처리하므로 setupIt이 없을 때만)
-                    if (!t.setupIt && isErrorPage(t.win)) {
-                        allFinished = false;
-                        if (Date.now() - (t.lastRetry || 0) > 15000) {
-                            t.lastRetry = Date.now();
-                            t.retryCount = (t.retryCount || 0) + 1;
-                            log(`⚠️ [${t.start}~${t.end}] 작업 중 로딩 지연 감지 → 구간 재시작 ${t.retryCount}회차`);
-                            t.win.location.href = MAIN_URL;
-                            startWorkerSetup(t);
-                        }
-                        continue;
-                    }
-
                     // 진행 메시지 영역(layer_page)을 한 번만 읽어 "전송 종료"와 "완료"를 함께 판정
                     const layer = (t.win.document.getElementById('layer_page')?.innerText || '').replace(/\s+/g, '');
 
-                    // 💡 "전송을 종료합니다" 조기 종료 → 해당 창만 닫고 같은 구간으로 새 창을 열어 다시 실행
+                    // 💡 "전송을 종료합니다" 조기 종료 → 해당 창만 닫고 같은 구간으로 새 창을 열어 다시 실행 (재실행 간격은 canReopen)
                     if (!t.setupIt && layer.includes(normalizedAbort)) {
                         allFinished = false;
-                        if (reopenedAt !== now) {
-                            reopenedAt = now;
+                        if (canReopen(now)) {
                             log(`⚠️ [${t.start}~${t.end}] 전송 종료 문구 감지 → 창 닫고 재실행 ${++t.abortCount}회차`);
                             reopenWorker(t);
                         }
