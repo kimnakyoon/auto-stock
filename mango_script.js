@@ -120,6 +120,22 @@ function mangoAutoLoop(CFG) {
     //    ("전송가능한 업데이트 또는 마켓이 없습니다. 전송을 종료합니다.")
     const ABORT_TEXT = '전송을 종료합니다';
     const normalizedAbort = ABORT_TEXT.replace(/\s+/g, '');
+    // 💡 진행 영역(layer_page)에는 상품마다 "......[순번] [날짜 시각] [마켓전송] ... → 전송 완료" 줄이 쌓인다.
+    //    순번은 범위와 상관없이 1부터 시작하므로(3~5번을 설정해도 1, 2, 3), 순번의 최댓값 = 그 창이 처리한 개수.
+    //    날짜([20260909 22:03:24])나 상품코드([421602])와 헷갈리지 않도록 줄머리 점(.) 바로 뒤의 [숫자]만 세고,
+    //    범위 개수를 넘는 숫자는 버린다.
+    const SEQ_RE = /\.\[(\d+)\]/g;
+    function processedCount(text, expected) {
+        let max = 0;
+        for (const m of text.matchAll(SEQ_RE)) {
+            const n = parseInt(m[1]);
+            if (n <= expected && n > max) max = n;
+        }
+        return max;
+    }
+    // 💡 범위를 다 못 채우고 "모두 완료" 가 뜨는 일(목록이 작업 중에 바뀌는 등)이 이 횟수만큼 연속되면
+    //    더 재실행하지 않고 끝난 창으로 본다 (같은 결과가 계속 반복되어 사이클이 영영 안 끝나는 것을 막음)
+    const SHORT_FINISH_MAX = 3;
     // 💡 SSG 로그인이 풀린 채 작업하면 작업 창에 뜨는 alert 문구
     //    ("로그인 페이지 또는 CAPTCHA 페이지입니다. 로그인 또는 CAPTCHA 해제 후에 ... 다시 진행하시기 바랍니다.")
     const CAPTCHA_TEXT = 'CAPTCHA';
@@ -383,6 +399,7 @@ function mangoAutoLoop(CFG) {
         t.win = nw;
         t.ready = false;
         t.captchaAt = 0;
+        t.shortPending = false; // 다시 연 창에서 또 짧게 끝나면 새로 센다
         startWorkerSetup(t); // brokenAt/openedAt 도 여기서 초기화
         focusRunner(); // 재실행 창이 앞으로 나오므로 실행 탭으로 되돌아온다
     }
@@ -427,7 +444,8 @@ function mangoAutoLoop(CFG) {
             const w = window.open(MAIN_URL, '_blank');
             // captchaAt: SSG 로그인/CAPTCHA 알림을 감지한 시각, brokenAt: 지연 페이지 등 깨진 상태를 처음 본 시각 (0 이면 감지 안 됨)
             // openedAt: 창을 연(다시 연) 시각 — 세팅 제한 시간 계산용 (둘 다 startWorkerSetup 이 정함), reopenCount: 창을 닫고 다시 연 횟수
-            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, reopenCount: 0, captchaAt: 0 };
+            // shortCount: 범위를 다 못 채우고 완료 문구가 떠서 다시 연 횟수, shortPending: 그 재실행이 아직 안 열렸음 (창 간격 대기 중, 두 번 세지 않도록)
+            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, reopenCount: 0, captchaAt: 0, shortCount: 0, shortPending: false };
             workers.push(t);
 
             if (!w) { // 창 자체가 안 열리면(팝업 차단 등) 이 구간은 건너뛰어 사이클이 영원히 멈추지 않게 함
@@ -487,7 +505,8 @@ function mangoAutoLoop(CFG) {
                     }
 
                     // 진행 메시지 영역(layer_page)을 한 번만 읽어 "전송 종료"와 "완료"를 함께 판정
-                    const layer = (t.win.document.getElementById('layer_page')?.innerText || '').replace(/\s+/g, '');
+                    const layerText = t.win.document.getElementById('layer_page')?.innerText || '';
+                    const layer = layerText.replace(/\s+/g, '');
 
                     // 💡 "전송을 종료합니다" 조기 종료 → 해당 창만 닫고 같은 구간으로 새 창을 열어 다시 실행
                     if (!t.setupIt && layer.includes(normalizedAbort)) {
@@ -497,8 +516,22 @@ function mangoAutoLoop(CFG) {
                     }
 
                     if (layer.includes(normalizedSuccess)) {
-                        finishWorker(t, `✅ [${t.start}~${t.end}] 완료. (3초 후 탭 자동 종료)`);
+                        // 💡 완료 문구가 떠도 처리 개수가 범위보다 적으면 정상 완료로 보지 않는다
+                        //    → 창을 닫고 같은 구간으로 다시 실행 (SHORT_FINISH_MAX 번 연속이면 포기하고 끝난 창으로 처리)
+                        const expected = t.end - t.start + 1;
+                        const processed = processedCount(layerText, expected);
+                        if (processed < expected && t.shortCount < SHORT_FINISH_MAX) {
+                            allFinished = false;
+                            if (!t.shortPending) { t.shortPending = true; t.shortCount++; }
+                            reopenWorker(t, `${processed}/${expected}개만 처리하고 완료 문구가 뜸 (${t.shortCount}/${SHORT_FINISH_MAX}번째)`);
+                            continue;
+                        }
                         const w = t.win;
+                        if (processed < expected) {
+                            finishWorker(t, `⚠️ [${t.start}~${t.end}] ${processed}/${expected}개 처리로 끝남 → ${SHORT_FINISH_MAX}번 연속이라 더 재실행하지 않음 (3초 후 탭 자동 종료)`);
+                        } else {
+                            finishWorker(t, `✅ [${t.start}~${t.end}] 완료 (${processed}/${expected}개 처리). (3초 후 탭 자동 종료)`);
+                        }
                         bgTimer.setTimeout(() => { try { w.close(); } catch (e) {} }, 3000);
                     } else {
                         allFinished = false;
