@@ -7,7 +7,7 @@
 
 const Y_STEP = 65;
 
-let winTarget = {};   // 팝업 windowId → 목표 좌표 {left, top} (크기는 건드리지 않음)
+let winTarget = {};   // 팝업 windowId → {left, top, opener} 목표 좌표(크기는 건드리지 않음)와 팝업을 연 작업탭 번호
 let loadState = null;
 
 // 서비스워커가 잠들었다 깨어나도 관리 목록을 잃지 않도록 세션 저장소에 보관
@@ -66,11 +66,24 @@ chrome.tabs.onCreated.addListener(async (tab) => {
             left: targetLeft,
             top: disp.bounds.top + (info.top || 0) + (info.row || 0) * Y_STEP
         });
-        winTarget[String(tab.windowId)] = { left: updated.left, top: updated.top };
+        winTarget[String(tab.windowId)] = { left: updated.left, top: updated.top, opener: tab.openerTabId };
         saveState();
 
         // 새 창이 앞으로 나오면서 아래 줄 창들을 덮으므로, 잠시 후 전체 재정렬
         scheduleRestack();
+    } catch (e) {}
+});
+
+// 💡 [팝업 정리 안전망] 작업탭이 닫히면(실행 탭이 재실행·완료·포기로 닫거나 사용자가 닫거나) 그 탭이 띄운 팝업을 모두 닫는다
+//    실행 탭은 창을 닫기 전에 창 안의 훅(__MANGO_CLOSE_POPUPS)으로 먼저 팝업을 닫지만, 훅이 추적하지 못한 팝업
+//    (페이지가 다시 불려 훅이 새로 심어지기 전에 뜬 팝업 등)은 여기서 마저 닫는다 → 재실행할 때마다 팝업이 쌓이지 않는다
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+    try {
+        await ensureLoaded();
+        const ids = Object.keys(winTarget).filter(id => winTarget[id].opener === tabId);
+        if (!ids.length) return;
+        // 닫기는 서로 독립이므로 한꺼번에 (이미 닫힌 창은 무시). 목록 정리는 windows.onRemoved 가 한다
+        await Promise.all(ids.map(id => chrome.windows.remove(parseInt(id)).catch(() => {})));
     } catch (e) {}
 });
 

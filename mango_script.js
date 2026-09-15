@@ -133,9 +133,13 @@ function mangoAutoLoop(CFG) {
         }
         return max;
     }
-    // 💡 범위를 다 못 채우고 "모두 완료" 가 뜨는 일(목록이 작업 중에 바뀌는 등)이 이 횟수만큼 연속되면
-    //    더 재실행하지 않고 끝난 창으로 본다 (같은 결과가 계속 반복되어 사이클이 영영 안 끝나는 것을 막음)
-    const SHORT_FINISH_MAX = 3;
+    // 💡 다음 창을 열어도 되는 신호: 앞 창의 진행 영역에 상품 하나가 끝났다는 문구가 하나라도 보이면 된다
+    //    ("... → 전송 완료", "... 업데이트 완료" — 공백을 지운 뒤 비교). 범위가 비어 바로 "모두 완료" 가 떠도 신호로 본다
+    const FIRST_DONE_MARKS = ['업데이트완료', '전송완료'];
+    // 💡 창 하나를 닫고 같은 구간으로 다시 여는 횟수의 상한 (사유를 가리지 않고 합산: 진행 기록 멈춤, 전송 종료 문구,
+    //    지연 페이지, 세팅 시간 초과, 범위를 다 못 채우고 완료 문구가 뜸). 이 횟수를 다 쓰면 더 재실행하지 않고
+    //    창을 닫아 끝난 창으로 본다 (같은 결과가 계속 반복되어 사이클이 영영 안 끝나거나 창이 계속 쌓이는 것을 막음)
+    const REOPEN_MAX = 3;
     // 💡 세팅이 끝난 뒤 진행 영역(layer_page)의 글이 이 시간 동안 하나도 늘지 않으면 멈춘 창으로 보고 닫고 다시 연다
     //    (마켓 로그인은 성공했는데 "전송을 시작합니다" 뒤로 전송 줄이 하나도 안 붙고 그대로 서 있는 경우,
     //     전송 도중 줄이 더 안 늘어나는 경우 — 그대로 두면 사이클이 영영 안 끝난다)
@@ -239,6 +243,14 @@ function mangoAutoLoop(CFG) {
                 return newWin;
             };
 
+            // 💡 실행 탭이 이 작업 창을 닫기 전에 호출: 이 창이 띄운 팝업(마켓 전송 창)을 모두 닫는다
+            //    (작업 창만 닫으면 팝업은 그대로 남아 재실행할 때마다 쌓인다)
+            window.__MANGO_CLOSE_POPUPS = function() {
+                for (const p of tracked.splice(0)) {
+                    try { if (p.w && !p.w.closed) p.w.close(); } catch(e) {}
+                }
+            };
+
             // 💡 백그라운드에서도 멈추지 않는 Worker 타이머로 팝업 상태 감시
             //    팝업에 "페이지 로딩이 잠시 지연" 에러가 뜨면 20초 간격으로 원래 주소로 재접속
             const blobUrl = URL.createObjectURL(new Blob(['setInterval(() => postMessage(1), 5000)'], {type:'application/javascript'}));
@@ -263,25 +275,73 @@ function mangoAutoLoop(CFG) {
         win.document.documentElement.appendChild(script);
     }
 
-    // 💡 작업 탭 세팅(검색 → 범위 입력 → 작업 시작)
-    //    지연 페이지 등 깨진 상태가 이어지거나 세팅이 너무 오래 걸리면 창을 닫고 다시 열어 처음부터 세팅한다
-    //    세팅이 끝나면(또는 창이 닫히면) t.onReady를 호출해 다음 창을 열도록 알린다
-    function startWorkerSetup(t) {
-        const wake = () => { const cb = t.onReady; t.onReady = null; if (cb) cb(); };
-        const stop = () => { bgTimer.clearInterval(t.setupIt); t.setupIt = null; };
+    // 세팅 감시 루프를 멈춘다 / 다음 창을 열려고 기다리는 쪽(waitUntilReady)을 깨운다
+    const stopSetup = (t) => { bgTimer.clearInterval(t.setupIt); t.setupIt = null; };
+    const wakeReady = (t) => { const cb = t.onReady; t.onReady = null; if (cb) cb(); };
 
-        stop();
+    // 💡 진행 메시지 영역(layer_page)을 읽어 판정 재료를 돌려준다 (첫 완료 대기와 감시 루프가 같이 쓴다)
+    //    [최적화] innerText 는 읽을 때마다 리플로우를 일으키므로(MDN), 리플로우 없는 textContent 길이가
+    //    지난 틱과 같으면(진행 줄이 안 늘었으면) 판정 결과도 같으니 읽지 않고 null 을 돌려준다
+    //    다만 그 상태가 PROGRESS_STALL_MS 이상 이어지면 멈춘 창이므로(stalled) 읽어서 돌려준다
+    //    (recheck 표식이 있으면 안 늘었어도 한 번 다시 읽는다)
+    function readProgress(t, now) {
+        const layerEl = t.win.document.getElementById('layer_page');
+        const len = layerEl ? layerEl.textContent.length : 0;
+        const changed = len !== t.lastLen;
+        const stalledMs = now - t.lastChangeAt;
+        if (changed) { t.lastLen = len; t.lastChangeAt = now; }
+        else if (!t.recheck && stalledMs < PROGRESS_STALL_MS) return null;
+        t.recheck = false;
+        const text = layerEl ? layerEl.innerText : '';
+        return { stalled: !changed && stalledMs >= PROGRESS_STALL_MS, stalledMs, text, norm: text.replace(/\s+/g, '') };
+    }
+
+    // 💡 진행 기록이 멈췄거나(마켓 로그인만 되고 "전송을 시작합니다" 뒤로 전송 줄이 하나도 안 붙거나, 전송 도중 줄이 더 안 늘어남)
+    //    "전송을 종료합니다" 조기 종료 문구가 떴으면 창을 닫고 같은 구간으로 다시 실행한다. 돌려주는 값: 재실행을 걸었으면 true
+    function reopenIfStuck(t, p) {
+        if (p.stalled) {
+            reopenWorker(t, `${Math.round(p.stalledMs / 60000)}분째 진행 기록이 늘지 않음 (${processedCount(p.text, t.expected)}/${t.expected}개 처리)`);
+            return true;
+        }
+        if (p.norm.includes(normalizedAbort)) { reopenWorker(t, '전송 종료 문구 감지'); return true; }
+        return false;
+    }
+
+    // 💡 작업 탭 세팅(검색 → 범위 입력 → 작업 시작) 뒤, 첫 완료 문구가 뜰 때까지 지켜본다
+    //    1단계(세팅): 지연 페이지 등 깨진 상태가 이어지거나 세팅이 너무 오래 걸리면 창을 닫고 다시 열어 처음부터 세팅한다
+    //    2단계(첫 완료 대기): 작업이 시작된 뒤 진행 영역에 "업데이트 완료"/"전송 완료" 가 하나라도 보이면 다음 창을 연다
+    //       (창을 한꺼번에 열면 앞 창의 마켓 로그인이 끝나기도 전에 뒤 창이 몰려 지연 페이지를 부르므로,
+    //        앞 창이 실제로 전송을 하고 있다는 것을 확인한 뒤에 연다)
+    //       이 동안 진행 기록이 PROGRESS_STALL_MS 동안 늘지 않거나 "전송을 종료합니다" 가 뜨면 창을 닫고 다시 연다
+    //       SSG 로그인/CAPTCHA 알림이 뜨면 기다리지 않고 넘어간다 (처리는 감시 루프가 한다)
+    //    어느 쪽이든 끝나면(또는 창이 닫히거나 포기하면) t.onReady 를 호출해 다음 창을 열도록 알린다
+    function startWorkerSetup(t) {
+        stopSetup(t);
         t.brokenAt = 0;
         t.openedAt = Date.now();
         t.setupIt = bgTimer.setInterval(() => {
             try {
                 const w = t.win;
-                if (!w || w.closed) { stop(); wake(); return; }
+                if (!w || w.closed) { stopSetup(t); wakeReady(t); return; }
 
                 const now = Date.now();
                 // 지연 페이지 등 깨진 상태 → 30초 이상 이어지면 창을 닫고 다시 연다 (재실행 시 이 루프는 새로 시작됨)
                 if (handleBroken(t, now)) return;
 
+                // ── 2단계: 첫 완료 문구 대기 ──
+                if (t.ready) {
+                    if (w.__MANGO_CAPTCHA) { stopSetup(t); wakeReady(t); return; }
+                    const p = readProgress(t, now);
+                    if (!p || reopenIfStuck(t, p)) return;
+                    if (FIRST_DONE_MARKS.some(m => p.norm.includes(m)) || p.norm.includes(normalizedSuccess)) {
+                        stopSetup(t);
+                        t.started = true;
+                        wakeReady(t);
+                    }
+                    return;
+                }
+
+                // ── 1단계: 세팅 ──
                 // 로딩이 영영 안 끝나 세팅이 제한 시간을 넘기면 창을 닫고 다시 연다
                 if (now - t.openedAt > SETUP_TIMEOUT_MS) { reopenWorker(t, `${SETUP_TIMEOUT_MS / 60000}분이 지나도록 세팅이 안 끝남`); return; }
 
@@ -302,9 +362,10 @@ function mangoAutoLoop(CFG) {
                     sI.value = t.start;
                     eI.value = t.end;
                     w.start_ini_all();
-                    stop();
                     t.ready = true;
-                    wake();
+                    t.lastLen = -1;
+                    t.lastChangeAt = now;
+                    log(`🪟 [${t.start}~${t.end}] 작업 시작 → 첫 완료 문구(업데이트 완료/전송 완료)가 보이면 다음 창을 엽니다.`);
                 }
             } catch (e) {}
         }, 1000); // [최적화] 3초 → 1초: 창이 뜨자마자 세팅되어 다음 창이 더 빨리 열림
@@ -357,10 +418,16 @@ function mangoAutoLoop(CFG) {
         });
     }
 
-    // 작업 창 하나가 세팅을 마칠 때까지 기다린다 (창이 닫히거나 3분이 지나면 그냥 넘어감)
+    // 작업 창 하나가 세팅을 마치고 첫 완료 문구를 띄울 때까지 기다린다
+    //    (창이 닫히거나 재실행을 포기해도 넘어간다. 재실행 3회를 다 쓰는 데 걸리는 시간보다 훨씬 긴 안전망만 둔다)
+    const READY_GUARD_MS = 30 * 60 * 1000;
     function waitUntilReady(t) {
         return new Promise(resolve => {
-            const guard = bgTimer.setTimeout(() => { t.onReady = null; resolve(); }, 180000);
+            const guard = bgTimer.setTimeout(() => {
+                t.onReady = null;
+                log(`⚠️ [${t.start}~${t.end}] ${READY_GUARD_MS / 60000}분이 지나도록 첫 완료 신호가 없어 다음 창으로 넘어갑니다.`);
+                resolve();
+            }, READY_GUARD_MS);
             t.onReady = () => { bgTimer.clearTimeout(guard); resolve(); };
         });
     }
@@ -376,26 +443,44 @@ function mangoAutoLoop(CFG) {
     const CAPTCHA_NOTIFY_MS = 60000; // 확장이 아직 안 닫아 줬으면 이 간격으로 다시 알린다
 
     // 💡 작업 창 하나를 끝난 것으로 표시한다 (사이클은 모든 창이 끝나면 다음 바퀴를 처음부터 시작)
+    //    세팅/첫 완료 대기 중이었다면 그 감시를 멈추고, 다음 창을 열려고 기다리는 쪽도 깨운다
     function finishWorker(t, msg) {
         t.done = true;
-        t.onReady = null;
+        stopSetup(t);
         if (msg) log(msg);
+        wakeReady(t);
+    }
+
+    // 💡 작업 창을 닫는다. 그 창이 띄운 팝업(마켓 전송 창)부터 닫고(창 안의 훅 __MANGO_CLOSE_POPUPS),
+    //    확장(background.js)도 작업 탭이 닫히면 그 탭이 연 팝업을 마저 닫는다(안전망)
+    function closeWorker(t) {
+        const w = t.win;
+        if (!w) return;
+        try { if (typeof w.__MANGO_CLOSE_POPUPS === 'function') w.__MANGO_CLOSE_POPUPS(); } catch (e) {}
+        try { w.close(); } catch (e) {}
     }
 
     // 💡 작업 창을 닫고 같은 구간으로 새 창을 열어 처음부터 다시 실행한다 (why: 기록에 남길 이유)
-    //    ("전송을 종료합니다" 조기 종료, 지연 페이지가 이어질 때, 세팅이 제한 시간을 넘길 때)
+    //    ("전송을 종료합니다" 조기 종료, 지연 페이지가 이어질 때, 세팅이 제한 시간을 넘길 때, 진행 기록이 멈출 때,
+    //     범위를 다 못 채우고 완료 문구가 뜰 때)
+    //    창당 REOPEN_MAX 회를 다 썼으면 더 재실행하지 않고 창(과 팝업)을 닫아 끝난 창으로 본다
     //    재실행 창은 처음 열 때처럼 한 번에 하나씩, REOPEN_GAP_MS 간격을 두고 연다 (한꺼번에 열면 다시 로딩 지연을 부름)
     //    간격이 안 지났으면 이번엔 열지 않는다 → 호출한 쪽 감시 루프가 다음 틱에 다시 시도한다
     //    (recheck 표식: 진행 영역이 안 바뀌어도 다음 틱에 다시 읽어 판정하라는 뜻. 정지 시계(lastChangeAt)는 건드리지 않는다)
-    //    돌려주는 값: 실제로 새 창을 열었으면 true (간격 대기, 창 열기 실패면 false)
+    //    돌려주는 값: 실제로 새 창을 열었으면 true (간격 대기, 포기, 창 열기 실패면 false)
     const REOPEN_GAP_MS = 10000;
     let lastReopenAt = 0;
     function reopenWorker(t, why) {
+        if (t.reopenCount >= REOPEN_MAX) {
+            closeWorker(t);
+            finishWorker(t, `⚠️ [${t.start}~${t.end}] ${why} → 재실행 ${REOPEN_MAX}회를 모두 써서 더 재실행하지 않고 이 구간을 끝냄 (창과 팝업 닫음, 모든 창이 끝나면 다음 사이클 시작)`);
+            return false;
+        }
         const now = Date.now();
         if (now - lastReopenAt < REOPEN_GAP_MS) { t.recheck = true; return false; }
         lastReopenAt = now;
-        log(`⚠️ [${t.start}~${t.end}] ${why} → 창 닫고 재실행 ${++t.reopenCount}회차`);
-        try { t.win.close(); } catch (e) {}
+        log(`⚠️ [${t.start}~${t.end}] ${why} → 창과 팝업 닫고 재실행 ${++t.reopenCount}/${REOPEN_MAX}회차`);
+        closeWorker(t);
         const nw = window.open(MAIN_URL, '_blank');
         if (!nw) {
             finishWorker(t, `⚠️ [${t.start}~${t.end}] 재실행 창을 열지 못했습니다. (팝업 차단 확인)`);
@@ -404,8 +489,10 @@ function mangoAutoLoop(CFG) {
         nw.opener = null;
         t.win = nw;
         t.ready = false;
+        t.started = false;
         t.captchaAt = 0;
         t.lastLen = -1;
+        t.lastChangeAt = 0;
         startWorkerSetup(t); // brokenAt/openedAt 도 여기서 초기화
         focusRunner(); // 재실행 창이 앞으로 나오므로 실행 탭으로 되돌아온다
         return true;
@@ -443,17 +530,18 @@ function mangoAutoLoop(CFG) {
         const totalTabs = Math.ceil(workRange / batchSize);
         const workers = [];
 
-        // 💡 창을 한 번에 다 열지 않고, 앞 창이 완전히 뜨고 작업이 시작된 뒤 다음 창을 연다
+        // 💡 창을 한 번에 다 열지 않고, 앞 창이 작업을 시작해 첫 완료 문구(업데이트 완료/전송 완료)를 띄운 뒤 다음 창을 연다
         for (let i = 0; i < totalTabs; i++) {
             const start = CFG.FIRST_START_LIMIT + (i * batchSize);
             const end = Math.min(start + batchSize - 1, endLimit);
 
             const w = window.open(MAIN_URL, '_blank');
+            // expected: 이 창이 처리해야 할 개수, ready: 세팅이 끝나 작업이 시작됨, started: 첫 완료 문구까지 확인됨 (둘 다 startWorkerSetup 이 정함)
             // captchaAt: SSG 로그인/CAPTCHA 알림을 감지한 시각, brokenAt: 지연 페이지 등 깨진 상태를 처음 본 시각 (0 이면 감지 안 됨)
-            // openedAt: 창을 연(다시 연) 시각 — 세팅 제한 시간 계산용 (둘 다 startWorkerSetup 이 정함), reopenCount: 창을 닫고 다시 연 횟수
-            // shortCount: 범위를 다 못 채우고 완료 문구가 떠서 다시 연 횟수, lastLen: 지난 틱에 읽은 진행 영역 글자 수 (안 바뀌면 다시 읽지 않음)
+            // openedAt: 창을 연(다시 연) 시각 — 세팅 제한 시간 계산용, reopenCount: 창을 닫고 다시 연 횟수 (사유 합산, REOPEN_MAX 까지)
+            // lastLen: 지난 틱에 읽은 진행 영역 글자 수 (안 바뀌면 다시 읽지 않음)
             // lastChangeAt: 진행 영역 글자 수가 마지막으로 바뀐 시각 (정지 판정용), recheck: 안 바뀌어도 다음 틱에 다시 판정하라는 표식
-            const t = { win: w, start, end, index: i, done: false, ready: false, onReady: null, setupIt: null, reopenCount: 0, captchaAt: 0, shortCount: 0, lastLen: -1, lastChangeAt: 0, recheck: false };
+            const t = { win: w, start, end, expected: end - start + 1, index: i, done: false, ready: false, started: false, onReady: null, setupIt: null, reopenCount: 0, captchaAt: 0, lastLen: -1, lastChangeAt: 0, recheck: false };
             workers.push(t);
 
             if (!w) { // 창 자체가 안 열리면(팝업 차단 등) 이 구간은 건너뛰어 사이클이 영원히 멈추지 않게 함
@@ -467,10 +555,10 @@ function mangoAutoLoop(CFG) {
             await waitUntilReady(t);
 
             if (i + 1 < totalTabs) {
-                if (t.ready) log(`🪟 ${i + 1}/${totalTabs}번째 창 준비 완료 → 다음 창을 엽니다.`);
+                if (t.started) log(`🪟 ${i + 1}/${totalTabs}번째 창 첫 완료 확인 → 다음 창을 엽니다.`);
                 await sleep(1000); // 팝업 위치 정렬이 겹치지 않도록 잠시 간격
-            } else if (t.ready) {
-                log(`🪟 ${i + 1}/${totalTabs}번째 창 준비 완료. 모든 창이 작업 중입니다.`);
+            } else if (t.started) {
+                log(`🪟 ${i + 1}/${totalTabs}번째 창 첫 완료 확인. 모든 창이 작업 중입니다.`);
             }
         }
 
@@ -514,49 +602,21 @@ function mangoAutoLoop(CFG) {
                         continue;
                     }
 
-                    // 진행 메시지 영역(layer_page)을 한 번만 읽어 "전송 종료"와 "완료"를 함께 판정
-                    //    [최적화] innerText 는 읽을 때마다 리플로우를 일으키므로(MDN), 리플로우 없는 textContent 길이가
-                    //    지난 틱과 같으면(진행 줄이 안 늘었으면) 판정 결과도 같으니 읽지 않고 넘어간다
-                    //    💡 다만 그 상태가 PROGRESS_STALL_MS 이상 이어지면 멈춘 창이다 (마켓 로그인만 되고 "전송을 시작합니다" 뒤로
-                    //       전송 줄이 하나도 안 붙거나, 전송 도중 줄이 더 안 늘어남) → 창을 닫고 같은 구간으로 다시 실행
-                    const layerEl = t.win.document.getElementById('layer_page');
-                    const len = layerEl ? layerEl.textContent.length : 0;
-                    const changed = len !== t.lastLen;
-                    const stalledMs = now - t.lastChangeAt;
-                    if (changed) { t.lastLen = len; t.lastChangeAt = now; }
-                    else if (!t.recheck && stalledMs < PROGRESS_STALL_MS) { allFinished = false; continue; }
-                    t.recheck = false;
-                    const layerText = layerEl ? layerEl.innerText : '';
-                    const layer = layerText.replace(/\s+/g, '');
-                    const expected = t.end - t.start + 1;
+                    // 진행 메시지 영역(layer_page)을 한 번만 읽어 "멈춤/전송 종료"와 "완료"를 함께 판정 (안 늘었으면 읽지 않음)
+                    const p = readProgress(t, now);
+                    if (!p || reopenIfStuck(t, p)) { allFinished = false; continue; }
 
-                    if (!changed && stalledMs >= PROGRESS_STALL_MS) {
-                        allFinished = false;
-                        reopenWorker(t, `${Math.round(stalledMs / 60000)}분째 진행 기록이 늘지 않음 (${processedCount(layerText, expected)}/${expected}개 처리)`);
-                        continue;
-                    }
-
-                    // 💡 "전송을 종료합니다" 조기 종료 → 해당 창만 닫고 같은 구간으로 새 창을 열어 다시 실행
-                    if (layer.includes(normalizedAbort)) {
-                        allFinished = false;
-                        reopenWorker(t, '전송 종료 문구 감지');
-                        continue;
-                    }
-
-                    if (layer.includes(normalizedSuccess)) {
+                    if (p.norm.includes(normalizedSuccess)) {
                         // 💡 완료 문구가 떠도 처리 개수가 범위보다 적으면 정상 완료로 보지 않는다
-                        //    → 창을 닫고 같은 구간으로 다시 실행 (SHORT_FINISH_MAX 번 연속이면 포기하고 끝난 창으로 처리)
-                        const processed = processedCount(layerText, expected);
-                        if (processed < expected && t.shortCount < SHORT_FINISH_MAX) {
+                        //    → 창을 닫고 같은 구간으로 다시 실행 (재실행 REOPEN_MAX 회를 다 썼으면 reopenWorker 가 포기하고 창을 닫는다)
+                        const processed = processedCount(p.text, t.expected);
+                        if (processed < t.expected) {
                             allFinished = false;
-                            if (reopenWorker(t, `${processed}/${expected}개만 처리하고 완료 문구가 뜸 (${t.shortCount + 1}/${SHORT_FINISH_MAX}번째)`)) t.shortCount++;
+                            reopenWorker(t, `${processed}/${t.expected}개만 처리하고 완료 문구가 뜸`);
                             continue;
                         }
-                        const w = t.win;
-                        finishWorker(t, processed < expected
-                            ? `⚠️ [${t.start}~${t.end}] ${processed}/${expected}개 처리로 끝남 → ${SHORT_FINISH_MAX}번 연속이라 더 재실행하지 않음 (3초 후 탭 자동 종료)`
-                            : `✅ [${t.start}~${t.end}] 완료 (${processed}/${expected}개 처리). (3초 후 탭 자동 종료)`);
-                        bgTimer.setTimeout(() => { try { w.close(); } catch (e) {} }, 3000);
+                        finishWorker(t, `✅ [${t.start}~${t.end}] 완료 (${processed}/${t.expected}개 처리). (3초 후 탭과 팝업 자동 종료)`);
+                        bgTimer.setTimeout(() => closeWorker(t), 3000);
                     } else {
                         allFinished = false;
                     }
